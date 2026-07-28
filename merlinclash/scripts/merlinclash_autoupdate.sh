@@ -147,6 +147,10 @@ update_clash
 set_version /jffs/softcenter/bin/clash merlinclash_clash_version clash -v
 set_version /jffs/softcenter/bin/clash merlinclash_clash_version_tmp clash_tmp -v
 
+ret=$(/jffs/softcenter/bin/clash -v 2>/dev/null | head -n 1)
+ver=$(echo "$ret" | awk '{if ($2=="Meta") print $1" "$2" "$3; else print $1" "$2}')
+[ -n "$ver" ] && dbus set merlinclash_binary_ver="$ver"
+
 if [ "$UPDATED" = "1" ]; then
   if [ "$WAS_RUNNING" = "1" ]; then
     restart_clash

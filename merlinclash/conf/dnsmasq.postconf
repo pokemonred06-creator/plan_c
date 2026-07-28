@@ -5,7 +5,8 @@ CONFIG=$1
 INDEX=$2
 eval `dbus export merlinclash`
 yamlpath=/jffs/softcenter/merlinclash/yaml_use/${merlinclash_set_yamlsel_start}.yaml
-dnslistenport=$(cat $yamlpath | awk -F: '/listen/{print $3}' | xargs echo -n)
+dnslistenport=$(cat $yamlpath 2>/dev/null | awk -F: '/listen/{print $3}' | xargs echo -n)
+dnslistenport=${dnslistenport:-23453}
 clash_process_started="0"
 
 detect_ip(){	

@@ -410,20 +410,8 @@ check_coremark(){
 	fi
 	#更新内核版本号
 	local ret=$(env -i PATH=${PATH} /jffs/softcenter/bin/clash -v 2>/dev/null | head -n 1)
-	local clashTmpV1=$(echo "$ret" | cut -d " " -f2)
-	local clashTmpV2=$(echo "$ret" | cut -d " " -f3)
-	if [ "$clashTmpV1" = "Meta" ]; then
-		merlinclash_binary_ver_tmp="Mihomo $clashTmpV2"; 
-	else
-		merlinclash_binary_ver_tmp=$clashTmpV1
-	fi
-
-	if [ -n "$merlinclash_binary_ver_tmp" ]; then
-		mcv="$merlinclash_binary_ver_tmp"		
-	else
-		mcv="null"
-	fi
-	dbus set merlinclash_binary_ver="$mcv"
+	local ver=$(echo "$ret" | awk '{if ($2=="Meta") print $1" "$2" "$3; else print $1" "$2}')
+	[ -n "$ver" ] && dbus set merlinclash_binary_ver="$ver"
 
 }
 

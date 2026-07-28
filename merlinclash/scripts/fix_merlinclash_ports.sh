@@ -46,3 +46,38 @@ fi
 
 # Also fix yaml_use
 fix_ports /jffs/softcenter/merlinclash/yaml_use/xraynew.yaml
+
+# Handle GFW List UI Switch
+GFW_SW=$(dbus get merlinclash_set_gfwlist_sw 2>/dev/null)
+if [ "$GFW_SW" = "1" ]; then
+    if ! grep -q "youtube.com" "$CURRENT_RULES" 2>/dev/null; then
+        cat << 'EOF' > /tmp/gfw_rules.txt
+  - DOMAIN-SUFFIX,youtube.com,🎯 总模式
+  - DOMAIN-SUFFIX,googlevideo.com,🎯 总模式
+  - DOMAIN-SUFFIX,ytimg.com,🎯 总模式
+  - DOMAIN-SUFFIX,youtu.be,🎯 总模式
+  - DOMAIN-SUFFIX,youtube-nocookie.com,🎯 总模式
+  - DOMAIN-SUFFIX,ggpht.com,🎯 总模式
+  - DOMAIN-KEYWORD,youtube,🎯 总模式
+  - DOMAIN-SUFFIX,google.com,🎯 总模式
+  - DOMAIN-SUFFIX,googleapis.com,🎯 总模式
+  - DOMAIN-SUFFIX,googleusercontent.com,🎯 总模式
+  - DOMAIN-SUFFIX,gstatic.com,🎯 总模式
+  - DOMAIN-SUFFIX,gvt1.com,🎯 总模式
+  - DOMAIN-SUFFIX,telegram.org,🎯 总模式
+  - DOMAIN-SUFFIX,t.me,🎯 总模式
+  - DOMAIN-SUFFIX,telegram.me,🎯 总模式
+  - DOMAIN-SUFFIX,twitter.com,🎯 总模式
+  - DOMAIN-SUFFIX,x.com,🎯 总模式
+  - DOMAIN-SUFFIX,twimg.com,🎯 总模式
+  - DOMAIN-SUFFIX,github.com,🎯 总模式
+  - DOMAIN-SUFFIX,githubusercontent.com,🎯 总模式
+EOF
+        sed -i '/^rules:/r /tmp/gfw_rules.txt' "$CURRENT_RULES" 2>/dev/null
+        sed -i '/^rules:/r /tmp/gfw_rules.txt' /jffs/softcenter/merlinclash/yaml_use/xraynew.yaml 2>/dev/null
+        rm -f /tmp/gfw_rules.txt
+    fi
+else
+    sed -i '/youtube/d; /googlevideo/d; /ytimg/d; /youtu\.be/d; /ggpht/d; /google\.com/d; /googleapis/d; /googleusercontent/d; /gstatic/d; /gvt1/d; /t\.me/d; /telegram/d; /twitter/d; /x\.com/d; /twimg/d; /github/d' "$CURRENT_RULES" 2>/dev/null
+    sed -i '/youtube/d; /googlevideo/d; /ytimg/d; /youtu\.be/d; /ggpht/d; /google\.com/d; /googleapis/d; /googleusercontent/d; /gstatic/d; /gvt1/d; /t\.me/d; /telegram/d; /twitter/d; /x\.com/d; /twimg/d; /github/d' /jffs/softcenter/merlinclash/yaml_use/xraynew.yaml 2>/dev/null
+fi

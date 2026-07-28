@@ -308,6 +308,7 @@ install_now(){
 	CUR_VERSION=$(cat /jffs/softcenter/merlinclash/version)
 	dbus set merlinclash_version="$CUR_VERSION"
 	dbus_nset merlinclash_set_watchdog_sw "1"
+	dbus_nset merlinclash_set_gfwlist_sw "0"
 	dbus set softcenter_module_merlinclash_install="1"
 	dbus set softcenter_module_merlinclash_version="$CUR_VERSION"
 	dbus set softcenter_module_merlinclash_title="Magic Catling2"

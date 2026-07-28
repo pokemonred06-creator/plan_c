@@ -121,7 +121,7 @@
 	function initializeFormData() {
 		// 复选框字段列表
 		const checkboxFields = [
-		"merlinclash_enable", "merlinclash_set_watchdog_sw", "merlinclash_set_chnroute_sw", 
+		"merlinclash_enable", "merlinclash_set_watchdog_sw", "merlinclash_set_chnroute_sw", "merlinclash_set_gfwlist_sw",
 		"merlinclash_set_recordbycron_sw", "merlinclash_ipt_proxyrouter_sw","merlinclash_ipt_proxyiot_sw","merlinclash_dns_proxydns_sw",
 		"merlinclash_dns_cleardns_sw", "merlinclash_set_mixport_sw", "merlinclash_dns_sniffer_sw","merlinclash_dns_dnshijack_sw",
 		"merlinclash_set_tcpcon_sw", "merlinclash_ipt_closeproxy_sw", 
@@ -385,6 +385,7 @@
 		db_merlinclash["merlinclash_set_watchdog_sw"] = E("merlinclash_set_watchdog_sw").checked ? '1' : '0';
 		db_merlinclash["merlinclash_ipt_ipv6_sw"] = E("merlinclash_ipt_ipv6_sw").checked ? '1' : '0';
 		db_merlinclash["merlinclash_set_chnroute_sw"] = E("merlinclash_set_chnroute_sw").checked ? '1' : '0';
+		db_merlinclash["merlinclash_set_gfwlist_sw"] = E("merlinclash_set_gfwlist_sw").checked ? '1' : '0';
 		db_merlinclash["merlinclash_set_recordbycron_sw"] = E("merlinclash_set_recordbycron_sw").checked ? '1' : '0'; 
 		db_merlinclash["merlinclash_dns_proxydns_sw"] = E("merlinclash_dns_proxydns_sw").checked ? '1' : '0';
 		db_merlinclash["merlinclash_ipt_proxyrouter_sw"] = E("merlinclash_ipt_proxyrouter_sw").checked ? '1' : '0';
@@ -3208,6 +3209,23 @@ function set_skin(){
 																					<div class="switch_field" style="display:table-cell;float: left;">
 																						<label for="merlinclash_set_chnroute_sw">
 																							<input id="merlinclash_set_chnroute_sw" type="checkbox" name="cir" class="switch" style="display: none;">
+																							<div class="switch_container" >
+																								<div class="switch_bar"></div>
+																								<div class="switch_circle transition_style">
+																									<div></div>
+																								</div>
+																							</div>
+																						</label>
+																					</div>
+																				</td>
+																			</tr>
+																			<!--使用 GFW List 预设规则-->
+																			<tr id="gfwlist_route">
+																				<th><a class="hintstyle" href="javascript:void(0);">使用 GFW List 预设规则</a></th>
+																				<td colspan="2">
+																					<div class="switch_field" style="display:table-cell;float: left;">
+																						<label for="merlinclash_set_gfwlist_sw">
+																							<input id="merlinclash_set_gfwlist_sw" type="checkbox" name="gfwlist" class="switch" style="display: none;">
 																							<div class="switch_container" >
 																								<div class="switch_bar"></div>
 																								<div class="switch_circle transition_style">

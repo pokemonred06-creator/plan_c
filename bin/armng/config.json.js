@@ -1,10 +1,10 @@
 {
-"build_date":"2025-07-07_15:18:04",
+"build_date":"2026-05-30_09:44:18",
 "description":"Merlin Clash",
 "home_url":"Module_merlinclash.asp",
-"md5":"6115059fdfb9ce53ade3c24997185046",
+"md5":"4a0c04f544b0bc49064b7b380d968ad3",
 "name":"merlinclash",
 "tar_url": "https://raw.githubusercontent.com/zusterben/plan_c/master/bin/armng/merlinclash.tar.gz", 
 "title":"Merlin Clash",
-"version":"25.07.07"
+"version":"26.05.30"
 }

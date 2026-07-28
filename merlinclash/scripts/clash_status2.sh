@@ -9,7 +9,7 @@ pid_clash=$(pidof clash)
 pid_d2s=$(pidof mc_dns2socks)
 #pid_watchdog=$(ps | grep clash_watchdog.sh | grep -v grep | awk '{print $1}')
 #pid_watchdog=$(cru l | grep "clash_watchdog")
-pid_watchdog=$(perpls | grep clash | grep -Eo "uptime.+-s\ " | awk -F" |:|/" '{print $3}')
+pid_watchdog=$(ps | grep clash_dog.sh | grep -v grep)
 date=$(echo_date)
 get(){
 	a=$(echo $(dbus get $1))

@@ -230,14 +230,17 @@ creat_ipset() {
 	
 	if [ ! -f "/jffs/softcenter/res/china_ip_route.ipset" ]; then
 		echo_date "创建大陆IP绕行ipset规则集" >> $LOG_FILE
-		cp /jffs/softcenter/merlinclash/yaml_basic/ChinaIP.yaml /tmp/china_ip_route.list 2>/dev/null
-		sed -i "s/'//g" /tmp/china_ip_route.list 2>/dev/null
-		sed -i "s/^ \{0,\}- //g" /tmp/china_ip_route.list 2>/dev/null
-		sed -i '/payload:/d' /tmp/china_ip_route.list 2>/dev/null
-		sed -i '/^ \{0,\}#/d' /tmp/china_ip_route.list 2>/dev/null
-		echo "create china_ip_route hash:net family inet hashsize 1024 maxelem 65536" >/jffs/softcenter/res/china_ip_route.ipset
-		awk '!/^$/&&!/^#/{printf("add china_ip_route %s'" "'\n",$0)}' /tmp/china_ip_route.list >>/jffs/softcenter/res/china_ip_route.ipset
-		rm -rf /tmp/china_ip_route.list 2>/dev/null
+		tmp_list=$(mc_mktemp /tmp/china_ip_route.XXXXXX) || return 1
+		tmp_ipset=$(mc_mktemp /tmp/china_ip_route_set.XXXXXX) || { rm -f "$tmp_list"; return 1; }
+		cp /jffs/softcenter/merlinclash/yaml_basic/ChinaIP.yaml "$tmp_list" 2>/dev/null
+		sed -i "s/'//g" "$tmp_list" 2>/dev/null
+		sed -i "s/^ \{0,\}- //g" "$tmp_list" 2>/dev/null
+		sed -i '/payload:/d' "$tmp_list" 2>/dev/null
+		sed -i '/^ \{0,\}#/d' "$tmp_list" 2>/dev/null
+		echo "create china_ip_route hash:net family inet hashsize 1024 maxelem 65536" > "$tmp_ipset"
+		awk '!/^$/&&!/^#/{printf("add china_ip_route %s \n",$0)}' "$tmp_list" >> "$tmp_ipset"
+		rm -f "$tmp_list" 2>/dev/null
+		mv -f "$tmp_ipset" /jffs/softcenter/res/china_ip_route.ipset 2>/dev/null || rm -f "$tmp_ipset"
 	fi
 	ipset -! create china_ip_route hash:net family inet hashsize 1024 maxelem 65536 || return 1
 	ipset flush china_ip_route 2>/dev/null || return 1
@@ -247,14 +250,17 @@ creat_ipset() {
 		ipset -! create china_ip_route6 hash:net family inet6 || return 1
 		if [ ! -f "/jffs/softcenter/res/china_ip_route6.ipset" ]; then
 			echo_date "创建大陆IP绕行ipv6-ipset规则集" >> $LOG_FILE
-			cp /jffs/softcenter/merlinclash/yaml_basic/ChinaIPv6.yaml /tmp/china_ip_route6.list 2>/dev/null
-			sed -i "s/'//g" /tmp/china_ip_route6.list 2>/dev/null
-			sed -i "s/^ \{0,\}- //g" /tmp/china_ip_route6.list 2>/dev/null
-			sed -i '/payload:/d' /tmp/china_ip_route6.list 2>/dev/null
-			sed -i '/^ \{0,\}#/d' /tmp/china_ip_route6.list 2>/dev/null
-			echo "create china_ip_route6 hash:net family inet6" >/jffs/softcenter/res/china_ip_route6.ipset
-			awk '!/^$/&&!/^#/{printf("add china_ip_route6 %s'" "'\n",$0)}' /tmp/china_ip_route6.list >>/jffs/softcenter/res/china_ip_route6.ipset
-			rm -rf /tmp/china_ip_route6.list 2>/dev/null
+			tmp_list6=$(mc_mktemp /tmp/china_ip_route6.XXXXXX) || return 1
+			tmp_ipset6=$(mc_mktemp /tmp/china_ip_route6_set.XXXXXX) || { rm -f "$tmp_list6"; return 1; }
+			cp /jffs/softcenter/merlinclash/yaml_basic/ChinaIPv6.yaml "$tmp_list6" 2>/dev/null
+			sed -i "s/'//g" "$tmp_list6" 2>/dev/null
+			sed -i "s/^ \{0,\}- //g" "$tmp_list6" 2>/dev/null
+			sed -i '/payload:/d' "$tmp_list6" 2>/dev/null
+			sed -i '/^ \{0,\}#/d' "$tmp_list6" 2>/dev/null
+			echo "create china_ip_route6 hash:net family inet6" > "$tmp_ipset6"
+			awk '!/^$/&&!/^#/{printf("add china_ip_route6 %s \n",$0)}' "$tmp_list6" >> "$tmp_ipset6"
+			rm -f "$tmp_list6" 2>/dev/null
+			mv -f "$tmp_ipset6" /jffs/softcenter/res/china_ip_route6.ipset 2>/dev/null || rm -f "$tmp_ipset6"
 		fi	
 		ipset flush china_ip_route6 2>/dev/null || return 1
 		ipset -! restore </jffs/softcenter/res/china_ip_route6.ipset 2>/dev/null || return 1
@@ -675,6 +681,21 @@ load_tproxy() {
 	done
 }
 
+mc_sync_parental_controls() {
+    local family=$1
+    "$family" -t filter -S PControls 2>/dev/null | grep -q '^-' || return 0
+    "$family" -t mangle -N MC_PControls 2>/dev/null || :
+    "$family" -t mangle -F MC_PControls || return 1
+    "$family" -t filter -S PControls 2>/dev/null | grep -v '^-N ' | sed 's/PControls/MC_PControls/g' | while read -r line; do
+        [ -n "$line" ] || continue
+        "$family" -t mangle $line || return 1
+    done || return 1
+    "$family" -t filter -S FORWARD 2>/dev/null | grep PControls | sed 's/-A FORWARD/-I PREROUTING/g;s/PControls/MC_PControls/g' | while read -r line; do
+        [ -n "$line" ] || continue
+        "$family" -t mangle $line || return 1
+    done || return 1
+}
+
 mc_create_firewall_targets() {
     local table
     # This kernel has no comment match. Owned child targets identify global
@@ -691,19 +712,16 @@ mc_create_firewall_targets() {
 }
 
 load_nat() {
-	nat_ready=$(iptables -t nat -L PREROUTING -v -n --line-numbers | grep -v PREROUTING | grep -v destination)
 	i=120
-	until [ -n "$nat_ready" ]; do
+	until iptables -t nat -S PREROUTING >/dev/null 2>&1 && [ -n "$(iptables -t nat -L PREROUTING -v -n 2>/dev/null | grep -v PREROUTING | grep -v destination)" ]; do
 		i=$(($i - 1))
 		if [ "$i" -lt 1 ]; then
 			echo_date "【错误】加载nat规则失败! 注意：路由AP模式下不能使用透明代理" >> $LOG_FILE
 			close_in_five
 		fi
 		sleep 1s
-		nat_ready=$(iptables -t nat -L PREROUTING -v -n --line-numbers | grep -v PREROUTING | grep -v destination)
 	done
 	echo_date "加载nat规则!" >> $LOG_FILE
-	sleep 1s
     mc_create_firewall_targets || return 1
 	apply_nat_rules || return 1
     sh /jffs/softcenter/scripts/clash_dns_tcp.sh || return 1
@@ -1435,8 +1453,7 @@ apply_nat_rules() {
 			ip -4 route replace local default dev lo table 233 || return 1
 			mc_ensure_policy_rule -4 0x2333 || return 1
 			#同步路由家长电脑控制
-			iptables -t filter -S PControls | sed 's/PControls/MC_PControls/g' | while read -r line; do iptables -t mangle $line || return 1; done || return 1
-			iptables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g;s/PControls/MC_PControls/g'|while read -r line; do iptables -t mangle $line || return 1; done || return 1
+			mc_sync_parental_controls iptables || return 1
 
 			#添加merlinclash_PREROUTING链
 			iptables -t mangle -N merlinclash_PREROUTING 2>/dev/null || iptables -t mangle -S merlinclash_PREROUTING >/dev/null 2>&1 || return 1
@@ -1519,8 +1536,7 @@ apply_nat_rules() {
 		mc_ensure_policy_rule -4 0x2333 || return 1
 
 		#同步路由家长电脑控制
-		iptables -t filter -S PControls | sed 's/PControls/MC_PControls/g' | while read -r line; do iptables -t mangle $line || return 1; done || return 1
-		iptables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g;s/PControls/MC_PControls/g'|while read -r line; do iptables -t mangle $line || return 1; done || return 1
+		mc_sync_parental_controls iptables || return 1
 
 		#添加merlinclash_PREROUTING链
 		iptables -t mangle -N merlinclash_PREROUTING 2>/dev/null || iptables -t mangle -S merlinclash_PREROUTING >/dev/null 2>&1 || return 1
@@ -1580,8 +1596,7 @@ apply_nat_rules() {
 			mc_ensure_policy_rule -6 0x2333 || return 1
 
 			#同步路由家长电脑控制
-			ip6tables -t filter -S PControls | sed 's/PControls/MC_PControls/g' | while read -r line; do ip6tables -t mangle $line || return 1; done || return 1
-			ip6tables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g;s/PControls/MC_PControls/g'|while read -r line; do ip6tables -t mangle $line || return 1; done || return 1
+			mc_sync_parental_controls ip6tables || return 1
 
 			#添加merlinclash_PREROUTING链
 			ip6tables -t mangle -N merlinclash_PREROUTING 2>/dev/null || ip6tables -t mangle -S merlinclash_PREROUTING >/dev/null 2>&1 || return 1
@@ -1712,8 +1727,7 @@ apply_nat_rules() {
 		mc_ensure_policy_rule -4 0x2333 || return 1
 
 		#同步路由家长电脑控制
-		iptables -t filter -S PControls | sed 's/PControls/MC_PControls/g' | while read -r line; do iptables -t mangle $line || return 1; done || return 1
-		iptables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g;s/PControls/MC_PControls/g'|while read -r line; do iptables -t mangle $line || return 1; done || return 1
+		mc_sync_parental_controls iptables || return 1
 
 		#添加merlinclash_PREROUTING链
 		iptables -t mangle -N merlinclash_PREROUTING 2>/dev/null || iptables -t mangle -S merlinclash_PREROUTING >/dev/null 2>&1 || return 1
@@ -1765,8 +1779,7 @@ apply_nat_rules() {
 			mc_ensure_policy_rule -6 0x2333 || return 1
 
 			#同步路由家长电脑控制
-			ip6tables -t filter -S PControls | sed 's/PControls/MC_PControls/g' | while read -r line; do ip6tables -t mangle $line || return 1; done || return 1
-			ip6tables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g;s/PControls/MC_PControls/g'|while read -r line; do ip6tables -t mangle $line || return 1; done || return 1
+			mc_sync_parental_controls ip6tables || return 1
 
 			#添加merlinclash_PREROUTING链
 			ip6tables -t mangle -N merlinclash_PREROUTING 2>/dev/null || ip6tables -t mangle -S merlinclash_PREROUTING >/dev/null 2>&1 || return 1
@@ -1898,7 +1911,6 @@ write_update_yaml_cron(){
 	
 	if [ -n "$yamlname" ] && echo "$yamlname" | grep -q '^AP_' && [ -f "${yaml_dlinks_file}" ];then
 		cru d autoupdate
-		cru d autologdel
 
 		if [ "$mcenable" == "1" ] && [ "${clash_process_started}" = "1" ]; then
 			update_time=$(awk -F',' '{print $1; exit}' "${yaml_dlinks_file}")
@@ -1936,7 +1948,6 @@ write_setmark_cron_job(){
 		echo_date "------ 未使用定时脚本，本处无记录日志 -------" >> /tmp/upload/merlinclash_node_mark.log
 	else
 		cru d autosermark
-		cru d autologdel
 		if [ "$mcenable" == "1" ] && [ "${clash_process_started}" = "1" ]; then
 			echo_date "开启Clash代理组状态保存服务，每分钟自动保存代理组设置" >> $LOG_FILE
 			echo_date "开启Clash代理组状态保存服务，每分钟自动保存代理组设置" > /tmp/upload/merlinclash_node_mark.log
@@ -2251,6 +2262,7 @@ apply_mc() {
 	/jffs/scripts/chatgpt-http3.sh || return 1
 	cru a clash_watchdog "* * * * * /bin/sh /jffs/softcenter/scripts/clash_watchdog.sh"
     cru a merlinclash_autoupdate "30 4 * * * /bin/sh /jffs/softcenter/scripts/merlinclash_autoupdate.sh"
+	cru a autologdel "0 * * * * /bin/sh /jffs/softcenter/scripts/clash_logautodel.sh"
 	write_setmark_cron_job #节点后台记忆
 	write_update_yaml_cron #定时订阅
 	write_clash_restart_cron_job #定时重启

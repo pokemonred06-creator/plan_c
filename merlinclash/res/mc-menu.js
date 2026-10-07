@@ -38,7 +38,7 @@ function UT(v) {
 }
 
 function createFormFields(data, settings) {
-	var id, id1, common, output, form = '', multiornot;
+	var a, id, common, output, form = '', multiornot;
 	var s = $.extend({
 		'align': 'left',
 		'grid': ['col-sm-3', 'col-sm-9']
@@ -175,7 +175,7 @@ function autoTextarea(elem, extra, maxHeight) {
 	elem.style.resize = 'none';
 
 	var change = function() {
-		var scrollTop, height,
+		var height,
 			padding = 0,
 			style = elem.style;
 
@@ -185,7 +185,6 @@ function autoTextarea(elem, extra, maxHeight) {
 		if (!isFirefox && !isOpera) {
 			padding = parseInt(getStyle('paddingTop')) + parseInt(getStyle('paddingBottom'));
 		};
-		scrollTop = document.body.scrollTop || document.documentElement.scrollTop;
 
 		elem.style.height = minHeight + 'px';
 		if (elem.scrollHeight > minHeight) {
@@ -197,9 +196,6 @@ function autoTextarea(elem, extra, maxHeight) {
 				style.overflowY = 'hidden';
 			};
 			style.height = height + extra + 'px';
-			scrollTop += parseInt(style.height) - elem.currHeight;
-			//document.body.scrollTop = scrollTop;
-			//document.documentElement.scrollTop = scrollTop;
 			elem.currHeight = parseInt(style.height);
 		};
 	};
@@ -642,21 +638,19 @@ function showDropdownClientList(_callBackFun, _callBackFunParam, _interfaceMode,
 	document.getElementById(_containerID).innerHTML = htmlCode;
 
 	var param = _callBackFunParam.split(">");
-	var clientMAC = "";
-	var clientIP = "";
-	var getClientValue = function(_attribute, _clienyObj) {
+	var getClientValue = function(_attribute, _clientObj) {
 		var attribute_value = "";
 		switch (_attribute) {
 			case "mac":
-				attribute_value = _clienyObj.mac;
+				attribute_value = _clientObj.mac;
 				break;
 			case "ip":
-				if (clientObj.ip != "offline") {
-					attribute_value = _clienyObj.ip;
+				if (_clientObj.ip != "offline") {
+					attribute_value = _clientObj.ip;
 				}
 				break;
 			case "name":
-				attribute_value = (clientObj.nickName == "") ? clientObj.name.replace(/'/g, "\\'") : clientObj.nickName.replace(/'/g, "\\'");
+				attribute_value = (_clientObj.nickName == "") ? _clientObj.name.replace(/'/g, "\\'") : _clientObj.nickName.replace(/'/g, "\\'");
 				break;
 			default:
 				attribute_value = _attribute;

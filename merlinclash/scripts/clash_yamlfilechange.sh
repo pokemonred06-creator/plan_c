@@ -1,134 +1,115 @@
 #!/bin/sh
-
-### 基础环境 ###
-source /jffs/softcenter/scripts/base.sh
-eval $(dbus export merlinclash_)
-
-alias echo_date='echo 【$(date +%Y年%m月%d日\ %X)】:'
-
-# 路径
+. /jffs/softcenter/scripts/base.sh
+. /jffs/softcenter/scripts/clash_safe.sh
+# httpd does not define KSROOT; the installation root is explicit.
+KSROOT=/jffs/softcenter
 DNS_PATH="$KSROOT/merlinclash/yaml_dns"
 BASIC_PATH="$KSROOT/merlinclash/yaml_basic"
-TMP_FILE="/tmp/edityaml.txt"
-LOG_FILE="/tmp/upload/dnsfile.log"
+LOG_FILE=/tmp/upload/dnsfile.log
 
-# 清空日志
-rm -rf "$LOG_FILE"
-
-### 工具函数 ###
-# URL 解码（不追加多余换行）
-urldecode() {
-    sed 's/+/ /g; s/%\(..\)/\\x\1/g;' | xargs -0 printf "%b"
+decode_percent() {
+    # Decode bytes as data. Backslashes in content cannot become printf escapes.
+    awk '
+    function h(c) { return index("0123456789abcdef",tolower(c))-1 }
+    { out=""; for(i=1;i<=length($0);i++) {
+        c=substr($0,i,1)
+        if(c=="+") c=" "
+        else if(c=="%") {
+            a=h(substr($0,i+1,1)); b=h(substr($0,i+2,1))
+            if(i+2>length($0)||a<0||b<0||a*16+b==0) exit 1
+            c=sprintf("%c",a*16+b); i+=2
+        }
+        out=out c
+    } print out }'
 }
-
-# 统一去掉 Windows 回车并删除所有“仅空白”的行
-strip_blank_lines() {
-    # sub(/\r$/,"") 去掉每行末尾的 \r；NF 为 0 则是空白行（含空格/Tab）
-    awk '{ sub(/\r$/,""); if (NF) print }'
-}
-
-get_dbus_value() {
-    dbus get "$1"
-}
-
-get_base64_bin() {
-	if [ -f "/jffs/softcenter/bin/base64_decode" ]; then
-		base=base64_decode
-		echo $base
-	elif [ -f "/bin/base64" ]; then
-		base=base64
-		echo "$base -d"
-	elif [ -f "/sbin/base64" ]; then
-		base=base64
-		echo "$base -d"
-	else
-		echo_date "【错误】未找到 base64 解码工具，无法继续执行" >> "$LOG_FILE"
-		echo_date "请参考 MerlinClash Wiki 解决办法" >> "$LOG_FILE"
-		exit 1
-	fi
-}
-
 clear_dbus_content() {
-    dbus list merlinclash_yamledit_content_ | cut -d "=" -f 1 | while read -r key; do
-        dbus remove "$key"
+    dbus list merlinclash_yamledit_content_ | cut -d= -f1 | while IFS= read -r key; do
+        dbus remove "$key" || exit 1
     done
 }
-
 write_yaml_file() {
-    local tag="$1" outfile
-
+    tag=$1
     case "$tag" in
         redirhost) outfile="$DNS_PATH/redirhost.yaml" ;;
-        fakeip)    outfile="$DNS_PATH/fakeip.yaml" ;;
-        sniffer)   outfile="$BASIC_PATH/sniffer.yaml" ;;
-        hosts)     outfile="$BASIC_PATH/hosts.yaml" ;;
-        head)      outfile="$BASIC_PATH/head.yaml" ;;
-        acl)       outfile="/jffs/softcenter/merlinclash/rule_custom/${merlinclash_set_yamlsel_start}_custom_rule.yaml" ;;
-        iptblack)  outfile="$BASIC_PATH/ipsetproxyarround.yaml" ;;
-        iptwhite)  outfile="$BASIC_PATH/ipsetproxy.yaml" ;;
-        *) echo_date "【警告】未知的 tag: $tag" >> "$LOG_FILE"; return ;;
+        fakeip) outfile="$DNS_PATH/fakeip.yaml" ;;
+        sniffer) outfile="$BASIC_PATH/sniffer.yaml" ;;
+        hosts) outfile="$BASIC_PATH/hosts.yaml" ;;
+        head) outfile="$BASIC_PATH/head.yaml" ;;
+        acl)
+            yamlname=$(dbus get merlinclash_set_yamlsel_start)
+            mc_valid_name "$yamlname" || return 1
+            outfile="$KSROOT/merlinclash/rule_custom/${yamlname}_custom_rule.yaml"
+            ;;
+        iptblack) outfile="$BASIC_PATH/ipsetproxyarround.yaml" ;;
+        iptwhite) outfile="$BASIC_PATH/ipsetproxy.yaml" ;;
+        *) echo 'Unknown editor tag' >> "$LOG_FILE"; return 1 ;;
     esac
-
-    # urldecode -> 去 CRLF + 删空行 -> 写入文件
-    # 注意：错误追加到日志，不混入 YAML 文件
-    if ! urldecode < "$TMP_FILE" | strip_blank_lines > "$outfile" 2>>"$LOG_FILE"; then
-        echo_date "【错误】写入 $outfile 失败" >> "$LOG_FILE"
-        return 1
-    fi
+    case "$tag" in
+        acl)
+            # Validate and encode every private record before publishing the
+            # source file or allowing its ACL child to replace the UI rows.
+            MC_REQUEST_PROFILE="$yamlname" /bin/sh "$KSROOT/scripts/clash_saveacls.sh" validate validate "$TMP_DIR/clean" || return 1
+            # One child owns the source and UI rollback if publication fails.
+            MC_REQUEST_PROFILE="$yamlname" /bin/sh "$KSROOT/scripts/clash_saveacls.sh" publish publish "$TMP_DIR/clean"
+            return $?
+            ;;
+        iptblack|iptwhite) ;;
+        *)
+            [ -s "$TMP_DIR/clean" ] || return 1
+            yq eval '.' "$TMP_DIR/clean" >/dev/null 2>>"$LOG_FILE" || return 1
+            [ "$(yq eval 'tag' "$TMP_DIR/clean" 2>>"$LOG_FILE")" = '!!map' ] || return 1
+            case "$tag" in redirhost|fakeip) fragment=dns ;; sniffer|hosts) fragment=$tag ;; *) fragment= ;; esac
+            if [ -n "$fragment" ]; then
+                [ "$(FRAGMENT_KEY="$fragment" yq eval '.[strenv(FRAGMENT_KEY)] | tag' "$TMP_DIR/clean" 2>>"$LOG_FILE")" = '!!map' ] || return 1
+            fi
+            duplicate_check=$(yq eval '.. | select(tag == "!!map") | ((keys | length) == (keys | unique | length))' "$TMP_DIR/clean" 2>>"$LOG_FILE") || return 1
+            printf '%s\n' "$duplicate_check" | grep -q false && return 1
+            ;;
+    esac
+    # Publish only after each decoder/parser succeeded, on the destination filesystem.
+    dst_tmp=$(mc_mktemp "${outfile}.XXXXXX") || return 1
+    cp "$TMP_DIR/clean" "$dst_tmp" || { rm -f "$dst_tmp"; return 1; }
+    chmod 600 "$dst_tmp" || { rm -f "$dst_tmp"; return 1; }
+    mv -f "$dst_tmp" "$outfile" || { rm -f "$dst_tmp"; return 1; }
 }
-
-### 主逻辑 ###
 main() {
-    local count tag content="" b64_bin
-
-    count_0="$(get_dbus_value merlinclash_yamledit_content_0)"
-    count="$(get_dbus_value merlinclash_yamledit_content_count)"
-    tag="$(get_dbus_value merlinclash_yamledit_tag)"
-
-    # 无数据则直接响应并退出
-    if [ -z "$count" ] || [ "$count" -eq 0 ] >/dev/null 2>&1; then
-        http_response "$1"
-        exit 0
-    fi
-    # ipt绕行为空，删除文件yaml
-    if [ "$count_0" == " " ] ; then
-        if [ "$tag" == "iptwhite" ]; then
-            rm -rf /jffs/softcenter/merlinclash/yaml_basic/ipsetproxy.yaml
-        elif [ "$tag" == "iptblack" ]; then
-            rm -rf /jffs/softcenter/merlinclash/yaml_basic/ipsetproxyarround.yaml
-        elif [ "$tag" == "acl" ]; then
-            rm -rf /jffs/softcenter/merlinclash/rule_custom/${merlinclash_set_yamlsel_start}_custom_rule.yaml
-        fi
-    fi
-    # 聚合分片内容
+    count=$(dbus get merlinclash_yamledit_content_count)
+    case "$count" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$count" -gt 0 ] || { http_response "$1"; return 0; }
+    [ "$count" -le 4096 ] || return 1
+    tag=$(dbus get merlinclash_yamledit_tag)
+    mc_lock || return 1
+    TMP_DIR=$(mc_mktemp -d /tmp/edityaml.XXXXXX) || { mc_unlock; return 1; }
+    trap 'rm -rf "$TMP_DIR"; mc_unlock' EXIT
+    trap 'exit 1' HUP INT TERM
+    : > "$TMP_DIR/b64" || return 1
     i=0
     while [ "$i" -lt "$count" ]; do
-        txt="$(get_dbus_value merlinclash_yamledit_content_$i)"
-        content="${content}${txt}"
-        i=$((i+1))
+        chunk=$(dbus get "merlinclash_yamledit_content_$i")
+        [ -n "$chunk" ] || return 1
+        printf '%s' "$chunk" >> "$TMP_DIR/b64" || return 1
+        i=$((i + 1))
     done
-
-    # base64 解码到临时文件（避免 echo 追加换行）
-    b64_bin="$(get_base64_bin)"
-    if ! printf "%s" "$content" | "$b64_bin" > "$TMP_FILE" 2>>"$LOG_FILE"; then
-        echo_date "【错误】Base64 解码失败" >> "$LOG_FILE"
-        http_response "$1"
-        exit 1
+    # A blank text entry deliberately clears list/rule templates.
+    if [ "$(cat "$TMP_DIR/b64")" = ' ' ]; then
+        case "$tag" in acl|iptblack|iptwhite) : > "$TMP_DIR/clean" ;; *) return 1 ;; esac
+    else
+        if [ -x "$KSROOT/bin/base64_decode" ]; then
+            "$KSROOT/bin/base64_decode" < "$TMP_DIR/b64" > "$TMP_DIR/decoded" 2>>"$LOG_FILE" || return 1
+        elif [ -x /bin/base64 ]; then
+            /bin/base64 -d < "$TMP_DIR/b64" > "$TMP_DIR/decoded" 2>>"$LOG_FILE" || return 1
+        else
+            return 1
+        fi
+        decode_percent < "$TMP_DIR/decoded" > "$TMP_DIR/percent" || return 1
+        awk '{ sub(/\r$/, ""); print }' "$TMP_DIR/percent" > "$TMP_DIR/clean" || return 1
     fi
-
-    if [ -s "$TMP_FILE" ]; then
-        echo_date "中间文件已创建" >> "$LOG_FILE"
-        echo_date "生成新文件: $tag" >> "$LOG_FILE"
-        write_yaml_file "$tag" || true
-        rm -f "$TMP_FILE"
-    fi
-    if [ "$tag" == "acl" ]; then
-        /bin/sh /jffs/softcenter/scripts/clash_saveacls.sh push push
-    fi
-    # 清理 dbus 临时键
-    clear_dbus_content
-
+    write_yaml_file "$tag" || return 1
+    clear_dbus_content || return 1
     http_response "$1"
 }
-
-main "$@"
+if ! main "$@"; then
+    echo 'Editor operation did not complete; decoder/parser failures retain the previous file' >> "$LOG_FILE"
+    http_response failed
+    exit 1
+fi

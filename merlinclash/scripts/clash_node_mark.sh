@@ -1,186 +1,116 @@
 #!/bin/sh
-
-source /jffs/softcenter/scripts/base.sh
+export PATH=/opt/bin:/opt/sbin:/jffs/softcenter/bin:/jffs/softcenter/scripts:$PATH
+. /jffs/softcenter/scripts/base.sh
+. /jffs/softcenter/scripts/clash_safe.sh
 LOG_FILE=/tmp/upload/merlinclash_node_mark.log
-eval $(dbus export merlinclash_)
-alias echo_date='echo 【$(date +%Y年%m月%d日\ %X)】:'
-LOGFILE=/tmp/upload/merlinclash_log.txt
-
-yamlname=${merlinclash_set_yamlsel_start}
-#配置文件路径
-yamlpath=/jffs/softcenter/merlinclash/yaml_use/$yamlname.yaml
-#提取配置认证码
-secret=$(yq eval ".secret" "$yamlpath" 2>/dev/null)
-#提取配置监听端口
-ecport=$(yq eval '.external-controller | split(":") | .[1]' "$yamlpath" 2>/dev/null)
-
-lan_ipaddr=$(nvram get lan_ipaddr)
-
-name=clash
-
-#闪存配置文件夹
-dirconf=/jffs/softcenter/merlinclash/mark
-#内存目录文件夹
-dirtmp=/tmp/clash
-mcenable=${merlinclash_enable}
-
-#在内存里对比并保存节点记忆文件到闪存，放进程守护里定时运行
-setmark () {
-	if [ "$mcenable" == "1" ]; then
-		if [ ! -z "$(pidof clash)" -a ! -z "$(netstat -anp | grep clash)" -a ! -n "$(grep "Parse config error" /tmp/clash_run.log)" ] ; then
-			echo_date "Clash运行正常，开始记录节点设置" >> $LOG_FILE
-			[ ! -d $dirtmp/mark ] && mkdir -p $dirtmp/mark
-			[ ! -d $dirconf ] && mkdir -p $dirconf
-			echo_date "创建/tmp/clash/mark文件夹,存放策略组节点记录" >> $LOG_FILE
-			get_save(){
-				if curl --version > /dev/null 2>&1;then
-					curl -s -H "Authorization: Bearer ${secret}" -H "Content-Type:application/json" "$1"
-				elif [ -n "$(wget --help 2>&1|grep '\-\-method')" ];then
-					wget -q --header="Authorization: Bearer ${secret}" --header="Content-Type:application/json" -O - "$1"
-				fi
-			}
-			echo_date "获取面板节点设置和运行模式" >> $LOG_FILE
-			# 获取节点信息
-			proxies_data=$(get_save http://$lan_ipaddr:$ecport/proxies)
-			# 获取运行模式
-			configs_data=$(get_save http://$lan_ipaddr:$ecport/configs)
-			# 提取mode字段
-			mode_value=$(echo $configs_data | jq -r '.mode')
-			# 保存节点信息和运行模式到同一个文件
-			echo $proxies_data | jq --arg mode "$mode_value" '{ "mark": (.proxies | map_values(select(.now != null) | { now })), "config": { "mode": $mode } }' 2>/dev/null >$dirtmp/mark/clash_web_save_${yamlname}.txt
-			if [ -s "$dirtmp/mark/clash_web_save_${yamlname}.txt" ]; then
-				if [ $(jq '.mark | length' $dirtmp/mark/clash_web_save_${yamlname}.txt) -gt 0 ]; then
-					diff $dirtmp/mark/clash_web_save_${yamlname}.txt $dirconf/${yamlname}.txt
-					[ "$?" = 0 ] && (rm -rf $dirtmp/mark/clash_web_save_${yamlname}.txt && echo_date "策略组未发生变化，清除临时文件" >> $LOG_FILE)  || (mv -f $dirtmp/mark/clash_web_save_${yamlname}.txt $dirconf/${yamlname}.txt && echo_date "策略组发生变化，重新创建记忆文件" >> $LOG_FILE)
-				else
-					echo_date "未找到有效节点信息：$dirtmp/mark/clash_web_save_${yamlname}.txt" >> $LOG_FILE
-					rm -rf $dirtmp/mark/clash_web_save_${yamlname}.txt
-				fi
-			else
-				echo_date "获取策略组节点发生异常" >> $LOG_FILE
-			fi
-		else
-			echo_date "Clash进程出现问题，删除保存节点定时任务" >> $LOGFILE
-			if [ -n "$(cru l | grep autosermark)" ]; then
-				echo_date 删除自动获取节点信息任务... >> $LOGFILE
-				sed -i '/autosermark/d' /var/spool/cron/crontabs/* >/dev/null 2>&1
-			fi
-			if [ -n "$(cru l | grep autologdel)" ]; then
-				echo_date 删除日志监测任务... >> $LOGFILE
-				sed -i '/autologdel/d' /var/spool/cron/crontabs/* >/dev/null 2>&1
-			fi
-			exit 1
-		fi
-	fi
-}
-
-#还原节点记忆
-remark(){
-	if [ -s $dirconf/${yamlname}.txt ] ; then
-		echo_date "▶还原节点位置记录..."
-		put_save(){
-			#if curl --version > /dev/null 2>&1;then
-			if [ "$1" == "curl" ]; then
-				curl -sS -X "$4" -H "Authorization: Bearer ${secret}" -H "Content-Type:application/json" "$2" -d "$3" -w '%{http_code}'
-			else
-				wget -q --method="$4" --header="Authorization: Bearer ${secret}" --header="Content-Type:application/json" --body-data="$3" "$2" >/dev/null
-			fi
-		}
-		#设置循环检测clash面板端口
-		i=1
-		while [ $i -lt 10 ];do
-			sleep 1
-			if curl --version > /dev/null 2>&1;then
-				test=$(curl -s http://$lan_ipaddr:${ecport})
-			else
-				test=$(wget -q -O - http://$lan_ipaddr:${ecport})
-			fi
-			[ -n "$test" ] && i=10
-		done
-		#发送数据
-		filename=$dirconf/${yamlname}.txt
-		jq -c '.mark | to_entries[]' ${filename} | while IFS= read -r line;
-		do
-			disp_group=$(echo "$line" | jq -r '.key' | sed 's/\\u0026/\&/g')
-			group_name=$(echo $disp_group | sed -e 's/ /%20/g' -e 's/\&/%26/g')
-			now_name=$(echo "$line" | jq -r '.value.now' )
-			disp_name=$(echo $now_name | sed 's/\\u0026/\&/g')
-			echo_date " " >> $LOG_FILE
-			echo_date " " >> $LOGFILE
-			echo_date "●代理集：$disp_group → 上次位置：$disp_name" >> $LOG_FILE
-			echo_date "●代理集：$disp_group → 上次位置：$disp_name" >> $LOGFILE
-			http_code=$(put_save curl "http://$lan_ipaddr:$ecport/proxies/${group_name}" "{\"name\":\"${now_name}\"}" "PUT")
-			if [ "$http_code" != "204" ]; then
-				echo_date "------------------------------------------" >> $LOG_FILE
-				echo_date "------------------------------------------" >> $LOGFILE
-				echo_date "|●--代理集：$disp_group 节点还原失败，尝试使用wget还原->" >> $LOG_FILE
-				echo_date "|●--代理集：$disp_group 节点还原失败，尝试使用wget还原->" >> $LOGFILE
-				echo_date "------------------------------------------" >> $LOG_FILE
-				echo_date "------------------------------------------" >> $LOGFILE
-				put_save "wget" http://$lan_ipaddr:$ecport/proxies/${group_name} "{\"name\":\"${now_name}\"}" "PUT"
-			else
-				echo_date "**************************************" >> $LOG_FILE
-				echo_date "**************************************" >> $LOGFILE
-				echo_date "******●代理集：$disp_group 节点还原成功******" >> $LOG_FILE
-				echo_date "******●代理集：$disp_group 节点还原成功******" >> $LOGFILE
-				echo_date "**************************************" >> $LOG_FILE
-				echo_date "**************************************" >> $LOGFILE
-			fi
-		done
-		# 还原Clash运行模式
-		mode_value=$(jq -r '.config.mode' ${filename})
-		if [ -n "$mode_value" ] && [ "$mode_value" != "null" ]; then
-			echo_date "" >> $LOG_FILE
-			echo_date "" >> $LOGFILE
-			echo_date "▶还原Clash运行模式..." >> $LOG_FILE
-			echo_date "▶还原Clash运行模式..." >> $LOGFILE
-			# 使用PATCH请求更新运行模式
-			http_code=$(put_save curl "http://$lan_ipaddr:$ecport/configs/" "{\"mode\": \"${mode_value}\"}" "PATCH")
-			if [ "$http_code" != "204" ]; then
-				echo_date "------------------------------------------" >> $LOG_FILE
-				echo_date "------------------------------------------" >> $LOGFILE
-				echo_date "|●--Clash运行模式：$mode_value 还原失败，尝试使用wget还原->" >> $LOG_FILE
-				echo_date "|●--Clash运行模式：$mode_value 还原失败，尝试使用wget还原->" >> $LOGFILE
-				echo_date "------------------------------------------" >> $LOG_FILE
-				echo_date "------------------------------------------" >> $LOGFILE
-				put_save "wget" http://$lan_ipaddr:$ecport/configs/ "{\"mode\": \"${mode_value}\"}" "PATCH"
-			else
-				echo_date "**************************************" >> $LOG_FILE
-				echo_date "**************************************" >> $LOGFILE
-				echo_date "******●Clash运行模式：$mode_value 还原成功******" >> $LOG_FILE
-				echo_date "******●Clash运行模式：$mode_value 还原成功******" >> $LOGFILE
-				echo_date "**************************************" >> $LOG_FILE
-				echo_date "**************************************" >> $LOGFILE
-			fi
-		fi
-		echo "1i\######$(date "+%Y-%m-%d %H:%M:%S") #######" > /tmp/upload/${yamlname}_status.txt
-		sed -i '$a BBABBBBC' /tmp/upload/${yamlname}_status.txt
-	else
-		echo_date "▶节点位置记录文件不存在 或 配置文件更换首次启动，跳过还原。" >> $LOGFILE
-		rm -rf /tmp/upload/${yamlname}_status.txt
-	fi
-
-}
-
-
-#检查进程端口日志都启动成功，成功就执行还原节点记录。
-start_remark () {
-	if [ ! -z "$(pidof $name)" -a ! -z "$(netstat -anp | grep $name)" -a -z "$(grep "Parse config error" /tmp/clash_run.log)" ] ; then
-		remark
-	else
-		echo_date "remark：$name进程没启动成功或端口没监听，跳过还原节点记录。" >> $LOGFILE
-	fi
-}
-
-case $1 in
-start_remark)
-	start_remark
-	;;
-remark)
-	remark
-	;;
-setmark)
-	setmark
-	;;
+mc_lock || exit 75
+trap 'mc_unlock' EXIT
+trap 'exit 1' HUP INT TERM
+case "$1" in
+    setmark)
+        [ "$(dbus get merlinclash_enable)" = 1 ] || exit 0
+        # UI selection can change before the old core is stopped. Attribute its
+        # selectors to the actual running profile and use that profile's API.
+        yamlname=$(mc_active_name) || exit 1
+        ;;
+    start_remark|remark)
+        if [ "${MC_REQUEST_PROFILE+x}" = x ]; then yamlname=$MC_REQUEST_PROFILE
+        else yamlname=$(mc_selected) || exit 1; fi
+        ;;
+    *) exit 1 ;;
 esac
+mc_valid_name "$yamlname" || exit 1
+yamlpath="/jffs/softcenter/merlinclash/yaml_use/$yamlname.yaml"
+secret=$(yq eval -r '.secret // ""' "$yamlpath" 2>/dev/null) || exit 1
+ec=$(yq eval -r '.external-controller // ""' "$yamlpath" 2>/dev/null) || exit 1
+ecport=${ec##*:}
+case "$ecport" in ''|*[!0-9]*) exit 1 ;; esac
+[ "$ecport" -gt 0 ] && [ "$ecport" -le 65535 ] || exit 1
+lan_ipaddr=$(nvram get lan_ipaddr)
+case "$lan_ipaddr" in ''|*[!0-9.]*) exit 1 ;; esac
+controller_host=${ec%:*}
+case "$controller_host" in 0.0.0.0|'[::]'|''|localhost) controller_host=127.0.0.1 ;; esac
+printf '%s\n' "$controller_host" | grep -Eq '^[0-9a-fA-F:.]+$|^\[[0-9a-fA-F:]+\]$' || exit 1
+case "$secret" in *'
+'*|*"$(printf '\r')"*) exit 1 ;; esac
+api="http://$controller_host:$ecport"
+dirconf=/jffs/softcenter/merlinclash/mark
+filename="$dirconf/$yamlname.txt"
 
+api_get() {
+    mc_curl -fsS --connect-timeout 2 --max-time 5 -H "Authorization: Bearer $secret" "$api/$1"
+}
+api_put() {
+    code=$(mc_curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' \
+        -X "$1" -H "Authorization: Bearer $secret" -H 'Content-Type: application/json' \
+        --data "$3" "$api/$2") || return 1
+    [ "$code" = 204 ]
+}
+mark_lock() {
+    mkdir -p "$dirconf" || return 1
+    # Selector records do not mutate lifecycle state; use their own stable lock inode.
+    exec 8>"/tmp/clash-mark-$yamlname.lock" || return 1
+    flock -n 8 || return 1
+    mark_tmp=$(mc_mktemp -d /tmp/clash-mark.XXXXXX) || return 1
+    trap 'rm -rf "$mark_tmp"; [ -z "$mark_dst" ] || rm -f "$mark_dst"; flock -u 8; mc_unlock' EXIT
+    trap 'exit 1' HUP INT TERM
+}
+setmark() {
+    [ "$(dbus get merlinclash_enable)" = 1 ] || return 0
+    [ -n "$(mc_core_pids)" ] || return 1
+    mark_lock || return 1
+    api_get proxies > "$mark_tmp/proxies" || return 1
+    api_get configs > "$mark_tmp/configs" || return 1
+    mode=$(jq -er '.mode | select(type == "string")' "$mark_tmp/configs") || return 1
+    case "$mode" in rule|global|direct) ;; *) return 1 ;; esac
+    jq -e --arg mode "$mode" '
+        .proxies | select(type == "object") |
+        {mark: map_values(select(.type == "Selector" and (.now | type == "string")) | {now}), config: {mode: $mode}}' "$mark_tmp/proxies" > "$mark_tmp/record" || return 1
+    cmp -s "$mark_tmp/record" "$filename" && return 0
+    mark_dst=$(mc_mktemp "${filename}.XXXXXX") || return 1
+    cp "$mark_tmp/record" "$mark_dst" && chmod 600 "$mark_dst" && mv -f "$mark_dst" "$filename"
+}
+remark() {
+    [ "$(dbus get merlinclash_enable)" = 1 ] || return 0
+    [ -s "$filename" ] || return 0
+    mark_lock || return 1
+    jq -e '.mark | type == "object"' "$filename" >/dev/null || return 1
+    i=0; ready=0
+    while [ "$i" -lt 10 ]; do
+        if api_get version > /dev/null; then ready=1; break; fi
+        i=$((i + 1))
+        [ "$i" -ge 10 ] || sleep 1
+    done
+    [ "$ready" = 1 ] || { echo 'Controller unavailable; selector restore deferred' >> "$LOG_FILE"; return 1; }
+    api_get proxies > "$mark_tmp/current" || return 1
+    jq -e '.proxies | type == "object"' "$mark_tmp/current" >/dev/null || return 1
+    jq -c '.mark | to_entries[] | select(.value.now | type == "string")' "$filename" > "$mark_tmp/entries" || return 1
+    failed=0
+    while IFS= read -r line; do
+        group_key=$(printf '%s\n' "$line" | jq -r '.key') || return 1
+        # Automatic URLTest/Fallback/LoadBalance groups do not support selector PUT.
+        # Old records may contain them or removed groups; leave their current state.
+        jq -e --arg group "$group_key" '.proxies[$group].type == "Selector"' "$mark_tmp/current" >/dev/null || continue
+        group_name=$(printf '%s\n' "$line" | jq -r '.key | @uri') || return 1
+        now_name=$(printf '%s\n' "$line" | jq -r '.value.now') || return 1
+        jq -e --arg group "$group_key" --arg name "$now_name" '
+            .proxies[$group].all | if type == "array" then index($name) != null else true end
+        ' "$mark_tmp/current" >/dev/null || continue
+        payload=$(jq -nc --arg name "$now_name" '{name:$name}') || return 1
+        if ! api_put PUT "proxies/$group_name" "$payload"; then
+            echo 'A saved selector could not be restored' >> "$LOG_FILE"
+            failed=1
+        fi
+    done < "$mark_tmp/entries"
+    mode=$(jq -er '.config.mode | select(type == "string")' "$filename") || return 1
+    case "$mode" in rule|global|direct) ;; *) return 1 ;; esac
+    payload=$(jq -nc --arg mode "$mode" '{mode:$mode}') || return 1
+    api_put PATCH configs "$payload" || failed=1
+    [ "$failed" = 0 ] || return 1
+    printf '###### %s ######\nBBABBBBC\n' "$(date '+%Y-%m-%d %H:%M:%S')" > "/tmp/upload/${yamlname}_status.txt"
+}
+case "$1" in
+    setmark) setmark ;;
+    start_remark|remark) remark ;;
+    *) exit 1 ;;
+esac

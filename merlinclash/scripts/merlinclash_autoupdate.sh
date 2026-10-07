@@ -1,164 +1,46 @@
 #!/bin/sh
 PATH=/jffs/softcenter/bin:/usr/sbin:/sbin:/bin:/usr/bin:/opt/bin:/opt/sbin
-LOG=/jffs/softcenter/merlinclash/autoupdate.log
-DEBUG=/tmp/autoupdate_debug.log
-API="https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/Prerelease-Alpha"
-CURL_CMD="/usr/sbin/curl"
-# Prefer Entware curl if available (works better in cron)
-if [ -x /opt/bin/curl ]; then
-  CURL_CMD="/opt/bin/curl"
-fi
-UPDATED=0
-WAS_RUNNING=0
-MAX_RETRIES=3
+export PATH
+LOG_FILE=/jffs/softcenter/merlinclash/autoupdate.log
+. /jffs/softcenter/scripts/clash_update_safe.sh
+API=https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/Prerelease-Alpha
 
-# Wait for network to be ready
-sleep 15
-
-stamp() { TZ=UTC-8 date "+%Y-%m-%d %H:%M:%S"; }
-log() { echo "$(stamp) $1" >> "$LOG"; }
-
-set_version() {
-  cmd=$1; key=$2; label=$3; shift 3
-  ver=$(LD_LIBRARY_PATH=/jffs/softcenter/bin "$cmd" "$@" 2>/dev/null | head -n 1)
-  if [ -n "$ver" ]; then
-    dbus set "$key"="$ver"
-    log "set $label version -> $ver"
-  else
-    log "WARN: $label returned empty version"
-  fi
+main() {
+    # A removed installation must not be revived by a surviving registration.
+    [ -x "$MC_SOFT/bin/clash" ] && [ -f "$MC_SOFT/scripts/clash_config.sh" ] || return 1
+    mc_update_begin || return 1
+    if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE")" -gt 65536 ]; then
+        mv -f "$LOG_FILE" "$LOG_FILE.old" || return 1
+    fi
+    mc_update_fetch "$API" "$MC_UPDATE_TMP/release.json" || { mc_update_log 'Release discovery failed TLS/HTTP verification.'; return 1; }
+    # GitHub digest is obtained through the authenticated release API. Never
+    # execute an asset when the publisher/API does not supply its SHA256.
+    jq -er '.assets | map(select(.name | test("^mihomo-linux-armv7-[A-Za-z0-9._-]+\\.gz$"))) | sort_by(.name) | .[0] | select(.digest | type == "string") | [.browser_download_url, .digest, .name] | @tsv' "$MC_UPDATE_TMP/release.json" > "$MC_UPDATE_TMP/asset" || {
+        mc_update_log 'No authenticated armv7 asset digest is available; keeping the installed engine.'
+        return 1
+    }
+    IFS="$(printf '\t')" read -r url digest asset < "$MC_UPDATE_TMP/asset" || return 1
+    case "$url" in https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/*) ;; *) return 1 ;; esac
+    case "$digest" in sha256:*) digest=${digest#sha256:} ;; *) return 1 ;; esac
+    mc_update_run "$MC_SOFT/bin/clash" -v || return 1
+    _mc_current=$(head -n 1 "$MC_UPDATE_TMP/probe-output" | awk '{print $3}')
+    _mc_release=${asset#mihomo-linux-armv7-}
+    _mc_release=${_mc_release%.gz}
+    if [ -n "$_mc_current" ] && [ "$_mc_current" = "$_mc_release" ]; then
+        mc_update_log "Already using $_mc_current; replacement skipped."
+        return 0
+    fi
+    mc_update_fetch "$url" "$MC_UPDATE_TMP/engine.gz" || return 1
+    mc_update_digest "$MC_UPDATE_TMP/engine.gz" "$digest" || { mc_update_log 'Asset SHA256 verification failed; downloaded code was not executed.'; return 1; }
+    _mc_compressed=$(wc -c < "$MC_UPDATE_TMP/engine.gz")
+    [ "$_mc_compressed" -le 67108864 ] || { mc_update_log 'Engine package exceeds the supported size limit.'; return 1; }
+    # Test and expand while the current engine is still running. Space is checked
+    # against expanded size plus backup before any destination write or stop.
+    gzip -t "$MC_UPDATE_TMP/engine.gz" || return 1
+    # Bound extraction before the exact expanded-space check. Firmware shells
+    # use 512-byte or KiB file-limit units; either bound fits this router.
+    (ulimit -f 131072 || exit 1; gunzip -c "$MC_UPDATE_TMP/engine.gz" > "$MC_UPDATE_TMP/engine") || return 1
+    mc_update_core "$MC_UPDATE_TMP/engine"
 }
-
-current_clash_version() {
-  /jffs/softcenter/bin/clash -v 2>/dev/null | head -n 1 | awk '{print $3}'
-}
-
-clash_running() {
-  if pidof clash >/dev/null 2>&1; then return 0; fi
-  ps | grep "[c]lash" >/dev/null 2>&1
-}
-
-disable_watchdog() {
-  sed -i "/clash_watchdog/d" /var/spool/cron/crontabs/* >/dev/null 2>&1
-}
-
-restart_clash() {
-  if [ -x /jffs/softcenter/merlinclash/clashconfig.sh ]; then
-    log "restarting via clashconfig.sh restart"
-    sh /jffs/softcenter/scripts/fix_merlinclash_ports.sh >/dev/null 2>&1
-    sh /jffs/softcenter/merlinclash/clashconfig.sh restart
-    return 0
-  fi
-  log "WARN: no restart script found"
-}
-
-update_clash() {
-  cur=$(current_clash_version)
-  
-  echo "$(stamp) DEBUG: Starting update check" >> "$DEBUG"
-  
-  i=0
-  url=""
-  while [ $i -lt $MAX_RETRIES ]; do
-      # Use HTTP (redirects to HTTPS) with -L to follow redirects
-      $CURL_CMD -Lks -o /tmp/api_response.json "http://api.github.com/repos/MetaCubeX/mihomo/releases/tags/Prerelease-Alpha" 2>/dev/null
-      raw_size=$(wc -c < /tmp/api_response.json 2>/dev/null || echo "0")
-      echo "$(stamp) DEBUG: curl used: $CURL_CMD, returned $raw_size bytes" >> "$DEBUG"
-      
-      url=$(grep -o 'https://github.com/MetaCubeX/mihomo/releases/download/Prerelease-Alpha/mihomo-linux-armv7-[^"]*\.gz' /tmp/api_response.json | head -n 1)
-      echo "$(stamp) DEBUG: grep result: $url" >> "$DEBUG"
-      
-      if [ -n "$url" ]; then
-          break
-      fi
-      log "WARN: failed to fetch asset URL or API error (attempt $((i+1))/$MAX_RETRIES), retrying in 30s..."
-      sleep 30
-      i=$((i+1))
-  done
-
-  rm -f /tmp/api_response.json
-
-  if [ -z "$url" ]; then
-    log "ERROR: no armv7 asset found after $MAX_RETRIES attempts"
-    return 1
-  fi
-
-  newver=$(echo "$url" | sed 's/.*linux-armv7-//' | sed 's/\.gz.*//')
-  
-  if [ -n "$cur" ] && [ "$cur" = "$newver" ]; then
-    log "clash already at $cur; skip download"
-    return 0
-  fi
-  
-  tmpdir=/tmp/mihomo.$$
-  mkdir -p "$tmpdir" || return 1
-  pkg="$tmpdir/mihomo.gz"
-  
-  j=0
-  dl_success=0
-  while [ $j -lt $MAX_RETRIES ]; do
-      if $CURL_CMD -Lks -o "$pkg" "$url"; then
-          dl_success=1
-          break
-      fi
-      log "WARN: download failed (attempt $((j+1))/$MAX_RETRIES), retrying in 30s..."
-      sleep 30
-      j=$((j+1))
-  done
-
-  if [ $dl_success -eq 0 ]; then
-    log "ERROR: download failed after $MAX_RETRIES attempts: $url"
-    rm -rf "$tmpdir"
-    return 1
-  fi
-  
-  need=$(du -k "$pkg" | awk '{print $1}')
-  avail=$(df -k /jffs | tail -n 1 | awk '{print $4}')
-  if [ -n "$need" ] && [ -n "$avail" ] && [ "$avail" -lt "$need" ]; then
-    log "WARN: not enough /jffs space (need ${need}K, avail ${avail}K)"
-    rm -rf "$tmpdir"
-    return 1
-  fi
-  
-  if ! gunzip -c "$pkg" > "$tmpdir/clash"; then
-    log "WARN: gunzip failed: $pkg"
-    rm -rf "$tmpdir"
-    return 1
-  fi
-  
-  chmod 755 "$tmpdir/clash"
-  
-  if clash_running; then
-    WAS_RUNNING=1
-    log "stopping running clash before replace"
-    disable_watchdog
-    killall clash >/dev/null 2>&1
-    sleep 1
-  fi
-  
-  [ -x /jffs/softcenter/bin/clash ] && cp /jffs/softcenter/bin/clash /jffs/softcenter/bin/clash.bak 2>/dev/null
-  mv "$tmpdir/clash" /jffs/softcenter/bin/clash
-  log "clash updated to $newver from $url"
-  UPDATED=1
-  rm -rf "$tmpdir"
-}
-
-update_clash
-set_version /jffs/softcenter/bin/clash merlinclash_clash_version clash -v
-set_version /jffs/softcenter/bin/clash merlinclash_clash_version_tmp clash_tmp -v
-
-ret=$(/jffs/softcenter/bin/clash -v 2>/dev/null | head -n 1)
-ver=$(echo "$ret" | awk '{if ($2=="Meta") print $1" "$2" "$3; else print $1" "$2}')
-[ -n "$ver" ] && dbus set merlinclash_binary_ver="$ver"
-
-if [ "$UPDATED" = "1" ]; then
-  if [ "$WAS_RUNNING" = "1" ]; then
-    restart_clash
-  else
-    log "update applied; clash was not running, restart skipped"
-  fi
-else
-  log "no update applied; restart skipped"
-fi
-
-log "merlinclash_autoupdate run completed"
+main
+exit $?

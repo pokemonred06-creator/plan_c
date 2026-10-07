@@ -1,87 +1,53 @@
 #!/bin/sh
-
-source /jffs/softcenter/scripts/base.sh
-eval `dbus export merlinclash`
-alias echo_date='echo 【$(date +%Y年%m月%d日\ %X)】:'
-mkdir -p /tmp/upload
+. /jffs/softcenter/scripts/base.sh
+. /jffs/softcenter/scripts/clash_safe.sh
 LOG_FILE=/tmp/upload/merlinclash_log.txt
-rm -rf $LOG_FILE
-echo "" > /tmp/upload/merlinclash_log.txt
-http_response "$1"
 
 restart_dnsmasq() {
-	rm -rf /tmp/etc/dnsmasq.user/dns_custom.conf >/dev/null 2>&1
-	local LOCAL_DNSISP_DNS1=$(nvram get wan0_dns | sed 's/ /\n/g' | grep -v 0.0.0.0 | grep -v 127.0.0.1 | sed -n 1p | grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}|:")
-    #local LOCAL_DNSISP_DNS2=$(nvram get wan0_dns | sed 's/ /\n/g' | grep -v 0.0.0.0 | grep -v 127.0.0.1 | sed -n 2p | grep -E "([0-9]{1,3}[\.]){3}[0-9]{1,3}|:")
-	if [ -n "$LOCAL_DNSISP_DNS1" ]; then
-		cat >/etc/resolv.conf <<-EOF
-			nameserver $LOCAL_DNSISP_DNS1
-		EOF
-	else
-		cat >/etc/resolv.conf <<-EOF
-			nameserver 223.5.5.5
-		EOF
-
-	fi
-	# Restart dnsmasq
-	echo_date "重启dnsmasq服务..."
-	service restart_dnsmasq >/dev/null 2>&1 &
-	dnsmasqpid=$(pidof dnsmasq)
-	for d in $dnsmasqpid; do
-		dns_procs=$((procs+1))  
-	done
-	if [ "${dns_procs}" -gt "1" ]; then
-		service restart_dnsmasq >/dev/null 2>&1
-	fi
+    # Firmware regenerates its own resolver settings. Retain unrelated DNS files.
+    service restart_dnsmasq >/dev/null 2>&1 || return 1
+    dns_procs=0
+    dnsmasqpid=$(pidof dnsmasq)
+    for d in $dnsmasqpid; do dns_procs=$((dns_procs + 1)); done
+    if [ "$dns_procs" -gt 1 ]; then service restart_dnsmasq >/dev/null 2>&1 || return 1; fi
 }
-
-prepare_dnsmasq(){
-	rm -rf /jffs/scripts/dnsmasq.postconf
-	[ -n "`cat /etc/dnsmasq.conf|grep no-resolv`" ] && sed -i '/no-resolv/d' /etc/dnsmasq.conf
-	[ -n "`cat /etc/dnsmasq.conf|grep servers-file`" ] && sed -i '/servers-file/d' /etc/dnsmasq.conf
-	[ -n "`cat /etc/dnsmasq.conf|grep dhcp-option-force=br1`" ] && sed -i '/dhcp-option-force=br1/d' /etc/dnsmasq.conf
-	[ -n "`cat /etc/dnsmasq.conf|grep dhcp-option-force=br2`" ] && sed -i '/dhcp-option-force=br2/d' /etc/dnsmasq.conf
-	#sed -i '$a no-resolv' /etc/dnsmasq.conf
-	#sed -i '$a servers-file=/tmp/resolv.dnsmasq' /etc/dnsmasq.conf
+prepare_dnsmasq() {
+    # Remove only the plugin-owned symlink, retaining unrelated firmware hooks.
+    if [ "$(readlink /jffs/scripts/dnsmasq.postconf)" = /jffs/softcenter/merlinclash/conf/dnsmasq.postconf ]; then
+        rm -f /jffs/scripts/dnsmasq.postconf || return 1
+    fi
 }
-
-start_rebuild(){
-
-	echo_date "重建yaml文件列表" >> $LOG_FILE
-	find /jffs/softcenter/merlinclash/yaml_bak -name "*.yaml" |sed 's#.*/##' |sed '/^$/d' | awk -F'.' '{print $1}' > /jffs/softcenter/merlinclash/yaml_bak/yamls.txt
-	#创建软链接
-	ln -sf /jffs/softcenter/merlinclash/yaml_bak/yamls.txt /tmp/upload/yamls.txt
-	echo_date "下拉列表重建完成" >> $LOG_FILE
+start_rebuild() {
+    root=/jffs/softcenter/merlinclash/yaml_bak
+    list=$(mc_mktemp "$root/.yamls.XXXXXX") || return 1
+    for profile in "$root"/*.yaml; do
+        [ -f "$profile" ] || continue
+        name=${profile##*/}; name=${name%.yaml}
+        mc_valid_name "$name" && printf '%s\n' "$name"
+    done > "$list"
+    mv -f "$list" "$root/yamls.txt" && ln -sf "$root/yamls.txt" /tmp/upload/yamls.txt || { rm -f "$list"; return 1; }
 }
-
-start_hot_off(){
-	echo_date "MC开始热关闭" >> $LOG_FILE
-	sh /jffs/softcenter/merlinclash/clashconfig.sh stop stop
-	echo_date "MC热关闭结束" >> $LOG_FILE
+start_hot_off() {
+    sh /jffs/softcenter/scripts/clash_config.sh stop stop
 }
-
-start_cool_off(){
-	echo_date "MC开始冷关闭" >> $LOG_FILE
-	dbus set merlinclash_enable=0
-	prepare
-	restart_dnsmasq
-	echo_date "已经关闭Magic Catling开机启动，5秒后重启路由器！！！" >> $LOG_FILE
-	sleep 5
-	reboot
+start_cool_off() {
+    sh /jffs/softcenter/scripts/clash_config.sh stop stop || return 1
+    prepare_dnsmasq || return 1
+    restart_dnsmasq || return 1
+    echo 'Magic Catling disabled; router restarting in five seconds' >> "$LOG_FILE"
+    mc_unlock
+    sleep 5
+    reboot
 }
-
-case $2 in
-rebuild)
-	start_rebuild
-	echo BBABBBBC >> /tmp/upload/merlinclash_log.txt
-	;;
-hot_off_mc)
-	start_hot_off
-	echo BBABBBBC >> /tmp/upload/merlinclash_log.txt
-	;;
-cool_off_mc)
-	start_cool_off
-	echo BBABBBBC >> /tmp/upload/merlinclash_log.txt
-	;;
+case "$2" in rebuild|hot_off_mc|cool_off_mc) ;; *) exit 1 ;; esac
+mc_lock || exit 75
+trap 'mc_unlock' EXIT
+trap 'exit 1' HUP INT TERM
+mkdir -p /tmp/upload || exit 1
+http_response "$1"
+case "$2" in
+    rebuild) start_rebuild || exit 1 ;;
+    hot_off_mc) start_hot_off || exit 1 ;;
+    cool_off_mc) start_cool_off || exit 1 ;;
 esac
-
+echo BBABBBBC >> "$LOG_FILE"

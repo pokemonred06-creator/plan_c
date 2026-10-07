@@ -1,13 +1,15 @@
 #!/bin/sh
 
 source /jffs/softcenter/scripts/base.sh
+. /jffs/softcenter/scripts/clash_safe.sh
 eval $(dbus export merlinclash_)
 alias echo_date='echo 【$(date +%Y年%m月%d日\ %X)】:'
 
 #==============================
 # 工具函数
 #==============================
-yamlpath="/tmp/upload/view.txt"
+status_name=$(mc_selected 2>/dev/null)
+yamlpath="$MC_ROOT/yaml_use/$status_name.yaml"
 
 porttmp=$(yq eval ".mixed-port" "$yamlpath" 2>/dev/null)
 if [ -z "$porttmp" ] || [ "$porttmp" == "null" ]; then
@@ -26,7 +28,7 @@ is_running() {
 
 # 获取 Clash 进程状态
 get_clash_status() {
-    local pid_clash=$(pidof clash)
+    local pid_clash=$(mc_core_pids)
     local start_time=$(get_dbus merlinclash_binary_startime)
 
     if [ -n "$pid_clash" ]; then
@@ -39,32 +41,49 @@ get_clash_status() {
 }
 
 # 获取 Watchdog 状态
+watchdog_scheduled() {
+    local jobs
+    [ "$(dbus get merlinclash_enable)" = 1 ] || return 1
+    jobs=$(cru l) || return 1
+    printf '%s\n' "$jobs" | awk '
+        NF == 8 && $6 == "/bin/sh" && $7 == "/jffs/softcenter/scripts/clash_watchdog.sh" && $8 == "#clash_watchdog#" {found=1}
+        NF == 7 && $6 == "/jffs/softcenter/scripts/clash_watchdog.sh" && $7 == "#clash_watchdog#" {found=1}
+        END { exit !found }
+    '
+}
 get_watchdog_status() {
-    local pid_watchdog=$(ps | grep clash_dog.sh | grep -v grep)
-    if [ -n "$pid_watchdog" ]; then
-        watchdog_status="<span style='color: #6C0'>$(echo_date) Mihomo 进程实时守护中！</span>"
+    if watchdog_scheduled; then
+        watchdog_status="<span style='color: #6C0'>$(echo_date) Mihomo 定时守护已启用，每分钟检查！</span>"
     else
-        watchdog_status="<span style='color: gold'>$(echo_date) Mihomo 进程守护未在运行！</span>"
+        watchdog_status="<span style='color: gold'>$(echo_date) Mihomo 定时守护未启用！</span>"
     fi
 }
 
 # 获取 YAML 面板信息
+escape_status_text() {
+    printf '%s' "$1" | sed 's/\&/\&amp;/g;s/</\&lt;/g;s/>/\&gt;/g;s/"/\&quot;/g;s/@/\&#64;/g'
+}
 get_yaml_info() {
-    local yaml_name=$(get_dbus merlinclash_set_yamlsel_start)
-
-    if [ -f "$yamlpath" ]; then
-        panel_host_port=$(awk -F": " '/external-controller/{print $2}' "$yamlpath")
-        panel_port=$(awk -F: '/external-controller/{print $3}' "$yamlpath")
-        panel_secret=$(awk '/secret:/{print $2}' "$yamlpath" | sed 's/"//g')
-    else
-        panel_host_port=""
-        panel_port=""
-        panel_secret=""
+    local yaml_name status_secret credential_status
+    yaml_name=$(mc_selected 2>/dev/null)
+    panel_host_port=""
+    panel_port=""
+    panel_secret=""
+    credential_status="未设置"
+    if mc_valid_name "$yaml_name" && [ -f "$MC_ROOT/yaml_use/$yaml_name.yaml" ]; then
+        yamlpath="$MC_ROOT/yaml_use/$yaml_name.yaml"
+        panel_host_port=$(yq eval -r '.external-controller // ""' "$yamlpath" 2>/dev/null) || panel_host_port=""
+        case "$panel_host_port" in *'@'*|*'<'*|*'>'*|*'&'*|*'"'*|*"'"*) panel_host_port="";; esac
+        panel_port=${panel_host_port##*:}
+        case "$panel_port" in ''|*[!0-9]*) panel_port="";; esac
+        status_secret=$(yq eval -r '.secret // ""' "$yamlpath" 2>/dev/null) || status_secret=""
+        [ -z "$status_secret" ] || credential_status="已设置"
     fi
-
-    yaml_info="<span style='display:table-cell;float: middle; color: gold'>当前配置为：$yaml_name</span>"
+    # Keep the existing response field count, with no credential in the status
+    # channel. Dashboard credentials remain in the authenticated settings UI.
+    yaml_info="<span style='display:table-cell;float: middle; color: gold'>当前配置为：$(escape_status_text "$yaml_name")</span>"
     panel_port_info="<span style='color: gold'>面板端口：$panel_port</span>"
-    panel_secret_info="<span style='color: gold'>面板密码：$panel_secret</span>"
+    panel_secret_info="<span style='color: gold'>面板密码：$credential_status</span>"
 }
 
 # 获取规则版本信息
@@ -100,10 +119,10 @@ request_url() {
     check_domain_blocked "$url"
     if [ $? -eq 0 ]; then
         if [ "$use_proxy" != "true" ]; then
-            result=$(curl --max-time 2 -s -H "$ua" "$url" 2>/dev/null)
+            result=$(mc_curl --max-time 2 -s -H "$ua" "$url" 2>/dev/null)
             [ -z "$result" ] && result=$(wget --no-hsts -q -O - --timeout=2 --tries=1 --header="$ua" "$url" 2>/dev/null)
         else
-            result=$(curl --max-time 2 -s -H "$ua" --proxy 127.0.0.1:"$proxy_port" "$url" 2>/dev/null)
+            result=$(mc_curl --max-time 2 -s -H "$ua" --proxy 127.0.0.1:"$proxy_port" "$url" 2>/dev/null)
             [ -z "$result" ] && result=$(wget --no-hsts -q -O - --timeout=2 --tries=1 --header="$ua" -e use_proxy=yes -e http_proxy=127.0.0.1:"$proxy_port" "$url" 2>/dev/null)
         fi
         echo "$result"

@@ -1,6 +1,7 @@
 #!/bin/sh
 
 source /jffs/softcenter/scripts/base.sh
+. /jffs/softcenter/scripts/clash_safe.sh
 alias echo_date='echo 【$(date +%Y年%m月%d日\ %X)】:'
 LOG_FILE=/tmp/upload/merlinclash_log.txt
 
@@ -64,10 +65,15 @@ encode_url_link(){
 
 
 urldecode() {
-    # 先处理 + 号转为空格
-    local encoded="${1//+/ }"
-    # 将 %XX 转为 \xXX，然后让printf解释
-    printf "$(echo "$encoded" | sed 's/%\([0-9a-fA-F][0-9a-fA-F]\)/\\x\1/g')"
+    printf '%s' "$1" | awk '
+        function hex(c) { return index("0123456789abcdef", tolower(c))-1 }
+        { if (NR>1) printf "\n"; for(i=1;i<=length($0);i++) {
+            c=substr($0,i,1)
+            if(c=="+") printf " "
+            else if(c=="%" && i+2<=length($0) && hex(substr($0,i+1,1))>=0 && hex(substr($0,i+2,1))>=0) {
+                printf "%c",16*hex(substr($0,i+1,1))+hex(substr($0,i+2,1)); i+=2
+            } else printf "%s",c
+        }}'
 }
 
 urlencode() {
@@ -109,9 +115,9 @@ download() {
     fi
 
 	if [ -n "$ua" ]; then
-        curl -sSkL --connect-timeout 30 --max-time 120 --user-agent "$ua" "$url" -o "$save_As"
+        mc_curl -fsSL --proto =https --proto-redir =https --connect-timeout 10 --max-time 120 --user-agent "$ua" "$url" -o "$save_As"
     else
-        curl -sSkL --connect-timeout 30 --max-time 120 "$url" -o "$save_As"
+        mc_curl -fsSL --proto =https --proto-redir =https --connect-timeout 10 --max-time 120 "$url" -o "$save_As"
     fi
 
 	if [ $? -ne 0 ]; then
@@ -126,45 +132,9 @@ download() {
 }
 
 ### 文件锁
-set_lock(){
-	mkdir -p /tmp/lock
-	lf=$(dbus get merlinclash_lockfile)
-	lcfiletmp=/tmp/lock/$lf.txt
-	echo_date "Magic Catling 前一进程锁文件:$lcfiletmp"  >> $LOG_FILE
+set_lock(){ mc_lock; }
 
-	lc=$$	
-	merlinclash_lockfile="$lc"
-	dbus set merlinclash_lockfile="$merlinclash_lockfile"
-	lcfile1=/tmp/lock/$lc.txt
-		echo_date "Magic Catling 创建本新进程锁文件${lcfile1}" >> $LOG_FILE 
-		touch $lcfile1	
-		i=60
-		echo_date "Magic Catling 将本任务pid写入lockfile:$merlinclash_lockfile" >> $LOG_FILE
-		echo $$ > ${lcfile1}
-
-		while [ $i -ge 0 ]; do
-			if [ -e ${lcfiletmp} ] && kill -0 `cat ${lcfiletmp}`; then 
-				echo_date "Magic Catling: $merlinclash_lockfile 锁进程中" >> $LOG_FILE
-				echo $$ > ${lcfile1}
-				sleep 5s
-			else
-				let i=0
-				echo_date "Magic Catling: 上个重启进程文件锁解除" >> $LOG_FILE
-			fi
-			let i--
-		done
-		
-		# 确保退出时，锁文件被删除 
-		trap "rm -rf ${lcfile1}; exit" INT TERM EXIT 
-		
-		echo $$ > ${lcfile1} 
-		echo_date "Magic Catling: 重新创建进程锁文件${lcfile1}" >> $LOG_FILE
-
-}
-
-unset_lock(){
-	rm -rf ${lcfile1} 
-}
+unset_lock(){ mc_unlock; }
 
 #MC2所有dbus变量
 # merlinclash_acl_content	自定义规则-内容

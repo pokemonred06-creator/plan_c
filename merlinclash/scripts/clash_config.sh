@@ -1,7 +1,9 @@
 #!/bin/sh
 
+umask 077
 source /jffs/softcenter/scripts/base.sh
 source /jffs/softcenter/scripts/clash_base.sh
+. /jffs/softcenter/scripts/clash_safe.sh
 alias echo_date='echo 【$(date +%Y年%m月%d日\ %X)】:'
 alias echo_date2='echo 【$(date +%Y年%m月%d日\ %X)】'
 LOG_FILE=/tmp/upload/merlinclash_log.txt
@@ -14,9 +16,10 @@ clash_process_started="0"
 #ipv6代理标志
 ipv6_flag="0"
 # 路由标记值
-mcrm="524288"
+mcrm=${merlinclash_ipt_routingmark_val:-524288}
+case "$mcrm" in *[!0-9]*) mcrm=524288 ;; esac
 ### 全局变量赋值
-yamlname=${merlinclash_set_yamlsel_start}
+yamlname=$(mc_selected) || yamlname=
 mcenable=${merlinclash_enable}
 dnshijacksel=${merlinclash_dns_dnshijack_sw}
 dfib=${merlinclash_dns_fakeip_server}
@@ -149,20 +152,35 @@ restart_dnsmasq() {
 	echo_date "创建dnsmasq.postconf软链接" >> $LOG_FILE
 	local link_dns_target=$(readlink "/jffs/scripts/dnsmasq.postconf")
 #	local link_sdn_target=$(readlink "/jffs/scripts/dnsmasq-sdn.postconf")
-	if [ "$link_dns_target" != "/jffs/softcenter/merlinclash/conf/dnsmasq.postconf" ]; then
-		ln -sf /jffs/softcenter/merlinclash/conf/dnsmasq.postconf /jffs/scripts/dnsmasq.postconf
-	fi
+    if [ "$link_dns_target" != "/jffs/softcenter/merlinclash/conf/dnsmasq.postconf" ]; then
+        if [ ! -e /jffs/scripts/dnsmasq.postconf ]; then
+            ln -s /jffs/softcenter/merlinclash/conf/dnsmasq.postconf /jffs/scripts/dnsmasq.postconf || return 1
+        elif ! grep -q '^# BEGIN Magic Catling 2$' /jffs/scripts/dnsmasq.postconf; then
+            local userhook wrapper
+            userhook=$(mc_mktemp /jffs/scripts/dnsmasq.postconf.user.XXXXXX) || return 1
+            cp -p /jffs/scripts/dnsmasq.postconf "$userhook" || return 1
+            wrapper=$(mc_mktemp /jffs/scripts/dnsmasq.postconf.wrapper.XXXXXX) || return 1
+            printf '#!/bin/sh\n"%s" "$@"\n# BEGIN Magic Catling 2\n[ ! -x /jffs/softcenter/merlinclash/conf/dnsmasq.postconf ] || /jffs/softcenter/merlinclash/conf/dnsmasq.postconf "$@"\n# END Magic Catling 2\n' "$userhook" > "$wrapper" || return 1
+            chmod 755 "$wrapper" && mv -f "$wrapper" /jffs/scripts/dnsmasq.postconf || return 1
+        fi
+    fi
 #	if [ "$link_sdn_target" != "/jffs/softcenter/merlinclash/conf/dnsmasq.postconf" ]; then
 #		ln -sf /jffs/softcenter/merlinclash/conf/dnsmasq.postconf /jffs/scripts/dnsmasq-sdn.postconf
 #	fi
 	# Restart dnsmasq
 	echo_date "重启dnsmasq服务..." >> $LOG_FILE
-	service restart_dnsmasq >/dev/null 2>&1
-	detect_running_status dnsmasq
+	local previous_dns
+	previous_dns=$(mc_dnsmasq_owner)
+	service restart_dnsmasq >/dev/null 2>&1 || return 1
+	mc_dnsmasq_wait "$previous_dns" || {
+		echo_date "dnsmasq重启或DNS配置生效超时" >> "$LOG_FILE"
+		return 1
+	}
 }
 
 ### ipset处理
 creat_ipset() {
+	local resolver ipv4_resolvers= ipv6_resolvers=
 	#创建直连名单
 	xt=`lsmod | grep xt_set`
 	OS=$(uname -r)
@@ -177,32 +195,38 @@ creat_ipset() {
 	[ -n "$IFIP_DNS1" ] && ISP_DNS_a="$ISP_DNS1" || ISP_DNS_a=""
 	[ -n "$IFIP_DNS2" ] && ISP_DNS_b="$ISP_DNS2" || ISP_DNS_b=""
 	[ -n "$IFIP_DHCPDNS1" ] && ISP_DNS_c="$DHCP_DNS1" || ISP_DNS_c=""
+	for resolver in $ISP_DNS_a $ISP_DNS_b $ISP_DNS_c; do
+		case "$resolver" in *:*) ipv6_resolvers="$ipv6_resolvers $resolver";; *) ipv4_resolvers="$ipv4_resolvers $resolver";; esac
+	done
 	echo_date "创建内网绕行ipset规则集" >> $LOG_FILE
-	ipset -! create direct_list nethash && ipset flush direct_list
-	ip_lan="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 255.255.255.255 $ISP_DNS_a $ISP_DNS_b $ISP_DNS_c $(get_wan0_cidr)"
+	ipset -! create direct_list nethash && ipset flush direct_list || return 1
+	ip_lan="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 255.255.255.255 $ipv4_resolvers $(get_wan0_cidr)"
 	for ip in $ip_lan; do
-		ipset -! add direct_list $ip >/dev/null 2>&1
+		ipset -! add direct_list $ip >/dev/null 2>&1 || return 1
 	done
 	if [ $(ipv6_mode) == "true" ]; then
 		echo_date "创建内网绕行ipv6-ipset规则集" >> $LOG_FILE
-		ipset -! create direct_list6 nethash family inet6 && ipset flush direct_list6
+		ipset -! create direct_list6 nethash family inet6 && ipset flush direct_list6 || return 1
 		ip6_lan="::/128 ::1/128 ::ffff:0:0/96 64:ff9b::/96 100::/64 2001::/32 2001:20::/28 2001:db8::/32 2002::/16 fc00::/7 fe80::/10 ff00::/8"
 		for ip6 in $ip6_lan; do
-			ipset -! add direct_list6 $ip6 >/dev/null 2>&1
+			ipset -! add direct_list6 $ip6 >/dev/null 2>&1 || return 1
+		done
+		for resolver in $ipv6_resolvers; do
+			ipset -! add direct_list6 "$resolver" >/dev/null 2>&1 || return 1
 		done
 		for a in $(ip addr | grep -w inet6 | awk '{print $2}') ; do 
-			ipset -! add direct_list6 $a >/dev/null 2>&1 
+			ipset -! add direct_list6 $a >/dev/null 2>&1 || return 1
 		done
 		fake_ip_range6=$(yq eval '.dns.fake-ip-range6' /jffs/softcenter/merlinclash/yaml_dns/fakeip.yaml)
-		ipset -! add direct_list6 $fake_ip_range6 nomatch >/dev/null 2>&1 
+		case "$fake_ip_range6" in ''|null) ;; *) ipset -! add direct_list6 "$fake_ip_range6" nomatch >/dev/null 2>&1 || return 1;; esac
 	fi
 	#
 	echo_date "创建clash相关ipset规则集" >> $LOG_FILE
-	ipset -! create router nethash
-	ipset -! create ipset_proxy nethash
-	ipset -! create ipset_proxy6 hash:net family inet6
-	ipset -! create ipset_proxyarround nethash
-	ipset -! create ipset_proxyarround6 hash:net family inet6
+	ipset -! create router nethash || return 1
+	ipset -! create ipset_proxy nethash || return 1
+	ipset -! create ipset_proxy6 hash:net family inet6 || return 1
+	ipset -! create ipset_proxyarround nethash || return 1
+	ipset -! create ipset_proxyarround6 hash:net family inet6 || return 1
 	
 	if [ ! -f "/jffs/softcenter/res/china_ip_route.ipset" ]; then
 		echo_date "创建大陆IP绕行ipset规则集" >> $LOG_FILE
@@ -215,10 +239,12 @@ creat_ipset() {
 		awk '!/^$/&&!/^#/{printf("add china_ip_route %s'" "'\n",$0)}' /tmp/china_ip_route.list >>/jffs/softcenter/res/china_ip_route.ipset
 		rm -rf /tmp/china_ip_route.list 2>/dev/null
 	fi
-	ipset -! flush china_ip_route 2>/dev/null
-	ipset -! restore </jffs/softcenter/res/china_ip_route.ipset 2>/dev/null
+	ipset -! create china_ip_route hash:net family inet hashsize 1024 maxelem 65536 || return 1
+	ipset flush china_ip_route 2>/dev/null || return 1
+	ipset -! restore </jffs/softcenter/res/china_ip_route.ipset 2>/dev/null || return 1
 
 	if [ $(ipv6_mode) == "true" ]; then
+		ipset -! create china_ip_route6 hash:net family inet6 || return 1
 		if [ ! -f "/jffs/softcenter/res/china_ip_route6.ipset" ]; then
 			echo_date "创建大陆IP绕行ipv6-ipset规则集" >> $LOG_FILE
 			cp /jffs/softcenter/merlinclash/yaml_basic/ChinaIPv6.yaml /tmp/china_ip_route6.list 2>/dev/null
@@ -229,20 +255,17 @@ creat_ipset() {
 			echo "create china_ip_route6 hash:net family inet6" >/jffs/softcenter/res/china_ip_route6.ipset
 			awk '!/^$/&&!/^#/{printf("add china_ip_route6 %s'" "'\n",$0)}' /tmp/china_ip_route6.list >>/jffs/softcenter/res/china_ip_route6.ipset
 			rm -rf /tmp/china_ip_route6.list 2>/dev/null
-		else
-			ipset -! flush china_ip_route6 2>/dev/null
-			ipset -! restore </jffs/softcenter/res/china_ip_route6.ipset 2>/dev/null
 		fi	
-		ipset -! flush china_ip_route6 2>/dev/null
-		ipset -! restore </jffs/softcenter/res/china_ip_route6.ipset 2>/dev/null
+		ipset flush china_ip_route6 2>/dev/null || return 1
+		ipset -! restore </jffs/softcenter/res/china_ip_route6.ipset 2>/dev/null || return 1
 	fi
 	if [ -f "/jffs/softcenter/merlinclash/yaml_basic/ipsetproxy.yaml" ]; then
 		echo_date "开始创建强制转发规则到ipset规则集..." >> $LOG_FILE
-		sh /jffs/softcenter/scripts/clash_ipsetproxy.sh 1 ipsetproxy
+		sh /jffs/softcenter/scripts/clash_ipsetproxy.sh 1 ipsetproxy || return 1
 	fi
 	if [ -f "/jffs/softcenter/merlinclash/yaml_basic/ipsetproxyarround.yaml" ]; then
 		echo_date "开始创建强制绕行规则到ipset规则集..." >> $LOG_FILE
-		sh /jffs/softcenter/scripts/clash_ipsetproxy.sh 1 ipsetproxyarround
+		sh /jffs/softcenter/scripts/clash_ipsetproxy.sh 1 ipsetproxyarround || return 1
 	fi
 
 }
@@ -261,50 +284,38 @@ check_ss(){
 	if [ "${ss_open}" == "1" ]; then
     	echo_date "检测到【科学上网】插件运行中，请先关闭该插件，再运行MerlinClash！" >> $LOG_FILE
 		echo_date "...MerlinClash！退出中..." >> $LOG_FILE
-		close_in_five	
+		return 1
     else
 	    echo_date "没有检测到冲突插件，准备开启MerlinClash！" >> $LOG_FILE
 	fi
 }
 
 check_yaml(){
-	#配合自定规则，此处修改为每次都从BAK恢复原版文件来操作-20200629
-	cp -rf /jffs/softcenter/merlinclash/yaml_bak/$yamlname.yaml $yamlpath
-	if [ -f "$yamlpath" ]; then
-		echo_date "检查到Clash配置文件存在！选中的配置文件是【$yamlname】" >> $LOG_FILE
-		#插入一行免得出错
-		sed -i '$a' $yamlpath
-		#修改订阅后，此处先合并RULE文件，根据自定义规则选择项来进行处理，值为：merlinclash_acl_plan
-		# if [ "$cusruleplan" == "closed" ] || [ "$cusruleplan" == "easy" ]; then
-		# 	#合并rule_bak默认文件
-		# 	cat /jffs/softcenter/merlinclash/rule_bak/${yamlname}_rules.yaml >> $yamlpath
-		# else
-		# 	cat /jffs/softcenter/merlinclash/rule_use/${yamlname}_rules.yaml >> $yamlpath
-		# fi
-		#拼接头文件
-		sed -i '$a' $yamlpath
-		cat /jffs/softcenter/merlinclash/yaml_basic/head.yaml >> $yamlpath
-		echo_date "标准头文件合并完毕" >> $LOG_FILE
-
-		#拼接Hosts文件
-		echo_date "拼接Host文件" >> $LOG_FILE
-		sed -i '$a' $yamlpath
-		cat /jffs/softcenter/merlinclash/yaml_basic/hosts.yaml >> $yamlpath
-		#SNIFFER拼合
-		if [ "${merlinclash_dns_sniffer_sw}" == "1" ]; then
-			#插入换行符免得出错
-			sed -i '$a' $yamlpath
-			echo_date "拼接Sniffer文件" >> $LOG_FILE
-			cat /jffs/softcenter/merlinclash/yaml_basic/sniffer.yaml >> $yamlpath
-		fi
-	else
-		echo_date "文件丢失，没有找到上传的配置文件！请先上传您的配置文件！" >> $LOG_FILE
-		echo_date "...MerlinClash！退出中..." >> $LOG_FILE
-		close_in_five
-	fi
+    local source="${MC_FORCE_SOURCE:-$MC_ROOT/yaml_bak/$yamlname.yaml}" golden
+    mc_valid_name "$yamlname" || return 1
+    if ! mc_validate_yaml "$source"; then
+        source="$MC_ROOT/yaml_use/$yamlname.yaml"
+        if ! mc_validate_yaml "$source"; then
+            golden=$(ls -1 "$MC_ROOT/yaml_bak/$yamlname.yaml".golden-* 2>/dev/null | sort | tail -1)
+            [ -n "$golden" ] && mc_validate_yaml "$golden" || return 1
+            source="$golden"
+        fi
+    fi
+    cp -p "$source" "$yamlpath" || return 1
+    complete_profile=0
+    if [ "$(yq e '.dns != null and .redir-port != null' "$yamlpath")" = true ]; then
+        complete_profile=1
+        return 0
+    fi
+    printf '\n' >> "$yamlpath" || return 1
+    cat "$MC_ROOT/yaml_basic/head.yaml" "$MC_ROOT/yaml_basic/hosts.yaml" >> "$yamlpath" || return 1
+    if [ "${merlinclash_dns_sniffer_sw}" = 1 ]; then
+        cat "$MC_ROOT/yaml_basic/sniffer.yaml" >> "$yamlpath" || return 1
+    fi
 }
 
 check_dnsplan(){
+	[ "${complete_profile:-0}" = 1 ] && return 0
 	#插入换行符免得出错
 	sed -i '$a' $yamlpath
 	case $dnsplan in
@@ -322,69 +333,39 @@ check_dnsplan(){
 
 }
 check_rule() {
-	/bin/sh /jffs/softcenter/scripts/clash_saveacls.sh push push
-	if [ -f "/jffs/softcenter/merlinclash/rule_custom/${yamlname}_custom_rule.yaml" ]; then
-		acl_nu=$(get_list merlinclash_acl_type 1 4)
-		num=0
-		if [ -n "$acl_nu" ]; then
-			# 将acl_nu转换为数组并逆序处理
-			acl_list=""
-			for acl in $acl_nu; do
-				acl_list="$acl $acl_list"
-			done
-			
-			for acl in $acl_list; do
-				type=$(get merlinclash_acl_type_$acl)
-				content=$(get merlinclash_acl_content_$acl)
-				lianjie=$(get merlinclash_acl_lianjie_$acl)
-				type=$(decode_url_link "$type")
-				content=$(decode_url_link "$content")
-				lianjie=$(decode_url_link "$lianjie")
-				type=$(urldecode "$type")
-				content=$(urldecode "$content")
-				lianjie=$(urldecode "$lianjie")
-				#写入自定规则到当前配置文件
-				num1=$(($num+1))
-				echo_date "写入第 $num1 条自定规则到当前配置文件" >> $LOG_FILE
-				if [ "$type" == "IP-CIDR" ]; then
-					yq eval ".rules = [\"$type,$content,$lianjie,no-resolve\"] + (.rules // [])" -i $yamlpath
-				else
-					yq eval ".rules = [\"$type,$content,$lianjie\"] + (.rules // [])" -i $yamlpath
-				fi
-				let num++
-			done
-		else
-			echo_date "没有自定规则" >> $LOG_FILE	
-		fi
-		dbus remove merlinclash_acl_type
-		dbus remove merlinclash_acl_content
-		dbus remove merlinclash_acl_lianjie
-	fi
-
+    local custom_file reverse_rules mc_rule mc_rule_type
+    mc_valid_name "$yamlname" || return 1
+    MC_REQUEST_PROFILE="$yamlname" /bin/sh /jffs/softcenter/scripts/clash_saveacls.sh push push || return 1
+    custom_file="/jffs/softcenter/merlinclash/rule_custom/${yamlname}_custom_rule.yaml"
+    [ -f "$custom_file" ] || return 0
+    reverse_rules=$(mc_mktemp /tmp/clash-custom-rules.XXXXXX) || return 1
+    # Build from the captured profile file. UI DBus fields may change while a
+    # startup holds the lifecycle lock, and are only a display/editing copy.
+    awk '{ sub(/\r$/, ""); if (NF) rules[++n]=$0 } END { for(i=n;i>0;i--)print rules[i] }' "$custom_file" > "$reverse_rules" || { rm -f "$reverse_rules"; return 1; }
+    while IFS= read -r mc_rule || [ -n "$mc_rule" ]; do
+        mc_rule_type=${mc_rule%%,*}
+        case "$mc_rule_type" in
+            IP-CIDR|IP-CIDR6)
+                case "$mc_rule" in *,no-resolve|*,no-resolve,*) ;; *) mc_rule="$mc_rule,no-resolve" ;; esac
+                ;;
+        esac
+        # Prepending reversed records preserves original order and the complete
+        # MATCH/AND/etc. rule syntax instead of rebuilding comma-delimited parts.
+        MC_RULE="$mc_rule" yq eval '.rules = [strenv(MC_RULE)] + (.rules // [])' -i "$yamlpath" || { rm -f "$reverse_rules"; return 1; }
+    done < "$reverse_rules"
+    rm -f "$reverse_rules"
 }
 
 set_Tolerance(){
-	#自定义容差值
-	intervalbox=${merlinclash_set_interval_sw}
-	urltestbox=${merlinclash_set_tolerance_sw}
-	if [ "$intervalbox" == "1" ]; then
-		interval=${merlinclash_set_interval_val}
-		echo_date "调整测ping时间间隔为: $interval " >> $LOG_FILE
-		yq eval -i "(.proxy-groups[] | select(.type == "url-test" or .type == "fallback" or .type == "load-balance")).interval = \"$interval\"" "$yamlpath"
-	else
-		echo_date "未自定义测ping时间间隔，保持默认" >> $LOG_FILE
-		
-	fi
-	if [ "$urltestbox" == "1" ]; then
-		tolerance=${merlinclash_set_tolerance_val}
-		echo_date "调整测ping容差为: $tolerance " >> $LOG_FILE
-		yq eval -i "(.proxy-groups[] | select(.type == "url-test" or .type == "fallback" or .type == "load-balance")).tolerance = \"$tolerance\"" "$yamlpath"
-	
-	else
-		echo_date "未自定义测ping容差，保持默认" >> $LOG_FILE
-		
-	fi
-
+    if [ "${merlinclash_set_interval_sw}" = 1 ]; then
+        case "$merlinclash_set_interval_val" in ''|*[!0-9]*) return 1 ;; esac
+        MC_VALUE="$merlinclash_set_interval_val" yq e -i '(.proxy-groups[] | select(.type == "url-test" or .type == "fallback" or .type == "load-balance")).interval = env(MC_VALUE)' "$yamlpath" || return 1
+    fi
+    if [ "${merlinclash_set_tolerance_sw}" = 1 ]; then
+        case "$merlinclash_set_tolerance_val" in ''|*[!0-9]*) return 1 ;; esac
+        MC_VALUE="$merlinclash_set_tolerance_val" yq e -i '(.proxy-groups[] | select(.type == "url-test" or .type == "fallback" or .type == "load-balance")).tolerance = env(MC_VALUE)' "$yamlpath" || return 1
+    fi
+    return 0
 }
 
 check_coremark(){
@@ -517,14 +498,23 @@ start_custom(){
 	yq eval ".external-controller = \"$lan_ipaddr:$ecport\"" -i "$yamlpath"
 	#修改管理面板密码
 	mds=${merlinclash_set_dashboard_password}
-	yq eval ".secret =  \"$mds\"" -i "$yamlpath"
-	echo_date 修改管理面板密码为：$mds >> $LOG_FILE
+	MC_SECRET="$mds" yq eval '.secret = strenv(MC_SECRET)' -i "$yamlpath"
+	echo_date "Controller credential configured" >> "$LOG_FILE"
 	#设置mark值
 	if [ "${merlinclash_ipt_proxyrouter_sw}" == "1" ]; then
 		yq eval ".routing-mark = $mcrm" -i "$yamlpath"
 		echo_date "设置路由流量标记值(Routing-Mark)为：$mcrm" >> $LOG_FILE
 	fi
 
+	# 开启ipv6赋值
+	if [ "$ipv6switch" == "1" ]; then
+		echo_date "修改yaml配置文件的IPv6相关设置" >> $LOG_FILE
+		yq eval ".ipv6 = true" -i "$yamlpath"
+		yq eval ".dns.ipv6 = true" -i "$yamlpath"
+	fi
+}
+
+apply_dns_settings(){
 	# 检测是否在lan设置中是否自定义过dns,如果有给干掉
 	if [ "${merlinclash_dns_cleardns_sw}" == "1" ]; then
 		echo_date "清除路由自定义DNS" >> $LOG_FILE
@@ -537,12 +527,7 @@ start_custom(){
 			nvram commit
 		fi	
 	fi
-	# 开启ipv6赋值
-	if [ "$ipv6switch" == "1" ]; then
-		echo_date "修改yaml配置文件的IPv6相关设置" >> $LOG_FILE
-		yq eval ".ipv6 = true" -i "$yamlpath"
-		yq eval ".dns.ipv6 = true" -i "$yamlpath"
-	fi
+
 }
 
 #端口取值
@@ -552,7 +537,8 @@ get_ports(){
 	mixport=$(yq eval ".mixed-port" "$yamlpath" 2>/dev/null)
 	proxy_port=$(yq eval ".redir-port" "$yamlpath" 2>/dev/null)
 	tproxy_port=$(yq eval ".tproxy-port" "$yamlpath" 2>/dev/null)
-	dnslistenport=$(yq eval ".dns.listen" "$yamlpath" 2>/dev/null)
+	dnslistenport=$(yq eval -r ".dns.listen" "$yamlpath" 2>/dev/null)
+    dnslistenport=${dnslistenport##*:}
 	ecport=$(yq eval '.external-controller | split(":") | .[1]' "$yamlpath" 2>/dev/null)
 }
 
@@ -563,7 +549,7 @@ set_sys() {
 	echo 1 >/proc/sys/vm/overcommit_memory
 	if [ -z "$(pidof jitterentropy-rngd)" -a -z "$(pidof haveged)" ];then
 		echo_date "启动haveged，为系统提供更多的可用熵！" >> $LOG_FILE
-		haveged -w 1024 >/dev/null 2>&1	
+		haveged -w 1024 9>&- >/dev/null 2>&1	
 	fi	
 }
 
@@ -575,31 +561,11 @@ set_sys() {
 #}
 
 startClashNormalOrPerp(){
-    local clashRunLog="/tmp/clash_run.log"
-    local watchdog=${merlinclash_set_watchdog_sw}
-    if [ "$watchdog" = "1" ];then
-        echo_date "检测到开启进程守护，开启进程实时守护..." >> $LOG_FILE
-		mkdir -p /jffs/softcenter/perp/clash
-		cat >/tmp/clash_dog.sh <<-EOF
-			#!/bin/sh
-			source /jffs/softcenter/scripts/base.sh
-			eval $(dbus export merlinclash_)
-			alias echo_date='echo 【$(date +%Y年%m月%d日\ %X)】:'
-
-			while [ "$merlinclash_enable" == "1" ]; do
-			    if [ ! -n "$(pidof clash)" ]; then
-			        /jffs/softcenter/bin/clash -d /jffs/softcenter/merlinclash/ -f $yamlpath 1>$clashRunLog  2>&1 &
-			    fi
-			    sleep 60
-			    continue
-			done
-
-		EOF
-		chmod +x /tmp/clash_dog.sh
-		/tmp/clash_dog.sh &
-    else
-        /jffs/softcenter/bin/clash -d /jffs/softcenter/merlinclash/ -f $yamlpath 1>$clashRunLog  2>&1 &
-    fi
+    mc_retire_supervisors
+    [ -z "$(mc_core_pids)" ] || return 1
+    # The single minute watchdog owns recovery; no competing restart loop.
+    /jffs/softcenter/bin/clash -d "$MC_ROOT" -f "$yamlpath" 9>&- >/tmp/clash_run.log 2>&1 &
+    echo $! > /tmp/clash.pid
 }
 
 start_clash(){
@@ -657,11 +623,27 @@ start_clash(){
 	rm -rf /tmp/upload/*.yaml
 }
 
+mc_saved_mark_valid() {
+    [ -s "$1" ] && jq -e '(.mark | type == "object") and
+        all(.mark[]; (type == "object") and (.now | type == "string")) and
+        (.config.mode == "rule" or .config.mode == "global" or .config.mode == "direct")' "$1" >/dev/null 2>&1
+}
 start_remark(){
-	if [ "${coremark}" == "0" ]; then          
-		echo_date -------------------- 📌记录/还原代理组状态 ------------------- >> $LOG_FILE
-		/bin/sh /jffs/softcenter/scripts/clash_node_mark.sh remark
+    # A fresh checkpoint can supplement native cache without applying a stale
+    # record during cold startup or to a different pending profile.
+    if [ -s "$MC_ROOT/mark/$yamlname.txt" ]; then
+        if ! mc_saved_mark_valid "$MC_ROOT/mark/$yamlname.txt"; then
+            echo_date "Saved selectors for $yamlname are invalid; record retained unchanged, using native or default selections" >> "$LOG_FILE"
+            return 0
+        fi
+    elif [ "${coremark}" != "0" ]; then
+        return 0
     fi
+    if [ "${coremark}" != "0" ] && [ "${MC_FRESH_MARK_PROFILE:-}" != "$yamlname" ]; then
+        return 0
+    fi
+	echo_date -------------------- 📌记录/还原代理组状态 ------------------- >> $LOG_FILE
+	MC_REQUEST_PROFILE="$yamlname" /bin/sh /jffs/softcenter/scripts/clash_node_mark.sh remark || return 1
 }
 
 ### nat加载
@@ -693,6 +675,21 @@ load_tproxy() {
 	done
 }
 
+mc_create_firewall_targets() {
+    local table
+    # This kernel has no comment match. Owned child targets identify global
+    # rules without additional modules; goto preserves the caller RETURN.
+    iptables -t nat -N merlinclash_DNS53 2>/dev/null || :
+    iptables -t nat -F merlinclash_DNS53 || return 1
+    iptables -t nat -A merlinclash_DNS53 -p udp -j REDIRECT --to-ports 53 || return 1
+    iptables -t nat -A merlinclash_DNS53 -p tcp -j REDIRECT --to-ports 53 || return 1
+    for table in nat mangle; do
+        iptables -t "$table" -N merlinclash_RETURN 2>/dev/null || :
+        iptables -t "$table" -F merlinclash_RETURN || return 1
+        iptables -t "$table" -A merlinclash_RETURN -j RETURN || return 1
+    done
+}
+
 load_nat() {
 	nat_ready=$(iptables -t nat -L PREROUTING -v -n --line-numbers | grep -v PREROUTING | grep -v destination)
 	i=120
@@ -707,7 +704,9 @@ load_nat() {
 	done
 	echo_date "加载nat规则!" >> $LOG_FILE
 	sleep 1s
-	apply_nat_rules
+    mc_create_firewall_targets || return 1
+	apply_nat_rules || return 1
+    sh /jffs/softcenter/scripts/clash_dns_tcp.sh || return 1
 }
 
 #设备绕行
@@ -771,6 +770,14 @@ get_action_chain() {
 }
 
 lan_bypass(){
+    mc_insert_dns53() {
+        local snapshot count position
+        snapshot=$(iptables -t nat -S PREROUTING 2>/dev/null) || return 1
+        count=$(printf '%s\n' "$snapshot" | awk '$1=="-A" {n++} END {print n+0}')
+        position=3
+        [ "$count" -ge 2 ] || position=$((count+1))
+        iptables -t nat -I PREROUTING "$position" -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1
+    }
 	# deivce_nu 获取已存数据序号
 	echo_date --------------------- 📌写入访问控制规则 --------------------- >> $LOG_FILE
 	OS=$(uname -r)
@@ -784,6 +791,20 @@ lan_bypass(){
 		fi
 	fi
 	mnm=$(dbus get merlinclash_nokpacl_method)
+	# Fresh starts have no owned sets after flush_nat. Create before flushing,
+	# and clear the applicable sets even when the last ACL row was removed.
+	if [ "$mnm" != "2" ]; then
+		for set in lan_mac_blacklist lan_mac_whitelist macblacklist_dns macwhitelist_dns; do
+			ipset -! create "$set" hash:mac hashsize 1024 maxelem 65536 || return 1
+			ipset flush "$set" || return 1
+		done
+	fi
+	if [ "$mnm" != "3" ]; then
+		for set in lan_ip_blacklist lan_ip_whitelist ipblacklist_dns ipwhitelist_dns; do
+			ipset -! create "$set" hash:net family inet hashsize 1024 maxelem 65536 || return 1
+			ipset flush "$set" || return 1
+		done
+	fi
 	echo_date "已设置【$(get_method_name $mnm)】过滤" >> $LOG_FILE
 	list_flag="0"
 	if [ "$tproxymode" == "closed" ] || [ "$tproxymode" == "udp" ]; then
@@ -857,64 +878,64 @@ lan_bypass(){
 				#访问自定端口走代理
 				if [ "$proxy_mode" == "1" ] && [ "$ports" != "" ]; then
 					# echo_date "$proxy_name 访问指定端口【$ports】转发进Clash" >> $LOG_FILE
-					iptables -t nat -A merlinclash $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p tcp $(factor $ports "-m multiport ! --dport") -j RETURN
-					iptables -t nat -A merlinclash $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p tcp $(factor $ports "-m multiport --dport") -$(get_jump_mode $proxy_mode) $(get_action_chain $proxy_mode)
+					iptables -t nat -A merlinclash $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p tcp $(factor $ports "-m multiport ! --dport") -j RETURN || return 1
+					iptables -t nat -A merlinclash $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p tcp $(factor $ports "-m multiport --dport") -$(get_jump_mode $proxy_mode) $(get_action_chain $proxy_mode) || return 1
 					
 					if [ "$tproxymode" == "udp" ]; then
-						iptables -t mangle -A merlinclash_PREROUTING $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p udp $(factor $ports "-m multiport --dport") -j merlinclash
-						iptables -t mangle -A merlinclash_PREROUTING $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p udp -j RETURN
+						iptables -t mangle -A merlinclash_PREROUTING $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p udp $(factor $ports "-m multiport --dport") -j merlinclash || return 1
+						iptables -t mangle -A merlinclash_PREROUTING $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p udp -j RETURN || return 1
 						
 					fi
 				fi
 			done
 			if [ "$mnm" != "2" ]; then
-				ipset -! flush lan_mac_blacklist 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/lan_mac_blacklist.ipset 2>/dev/null
-				ipset -! flush macblacklist_dns 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/macblacklist_dns.ipset 2>/dev/null
-				ipset -! flush lan_mac_whitelist 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/lan_mac_whitelist.ipset 2>/dev/null
-				ipset -! flush macwhitelist_dns 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/macwhitelist_dns.ipset 2>/dev/null
+				ipset -! flush lan_mac_blacklist 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/lan_mac_blacklist.ipset 2>/dev/null || return 1
+				ipset -! flush macblacklist_dns 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/macblacklist_dns.ipset 2>/dev/null || return 1
+				ipset -! flush lan_mac_whitelist 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/lan_mac_whitelist.ipset 2>/dev/null || return 1
+				ipset -! flush macwhitelist_dns 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/macwhitelist_dns.ipset 2>/dev/null || return 1
 			fi
 			if [ "$mnm" != "3" ]; then
-				ipset -! flush lan_ip_blacklist 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/lan_ip_blacklist.ipset 2>/dev/null
-				ipset -! flush ipblacklist_dns 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/ipblacklist_dns.ipset 2>/dev/null
-				ipset -! flush lan_ip_whitelist 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/lan_ip_whitelist.ipset 2>/dev/null
-				ipset -! flush ipwhitelist_dns 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/ipwhitelist_dns.ipset 2>/dev/null
+				ipset -! flush lan_ip_blacklist 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/lan_ip_blacklist.ipset 2>/dev/null || return 1
+				ipset -! flush ipblacklist_dns 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/ipblacklist_dns.ipset 2>/dev/null || return 1
+				ipset -! flush lan_ip_whitelist 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/lan_ip_whitelist.ipset 2>/dev/null || return 1
+				ipset -! flush ipwhitelist_dns 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/ipwhitelist_dns.ipset 2>/dev/null || return 1
 			fi
 			#IPTABLES写法
 			#1.黑名单内先过滤
 			#iptables写法
-			iptables -t nat -I merlinclash -m set --match-set lan_mac_blacklist src -p tcp -j RETURN >/dev/null 2>&1
-			iptables -t nat -I merlinclash -m set --match-set lan_ip_blacklist src -p tcp -j RETURN >/dev/null 2>&1
+			if [ "$mnm" != "2" ]; then iptables -t nat -I merlinclash -m set --match-set lan_mac_blacklist src -p tcp -j RETURN >/dev/null 2>&1 || return 1; fi
+			if [ "$mnm" != "3" ]; then iptables -t nat -I merlinclash -m set --match-set lan_ip_blacklist src -p tcp -j RETURN >/dev/null 2>&1 || return 1; fi
 			if [ "$tproxymode" == "udp" ]; then
-				iptables -t mangle -I merlinclash_PREROUTING -p udp --dport 53 -j RETURN
+				iptables -t mangle -I merlinclash_PREROUTING -p udp --dport 53 -j RETURN || return 1
+				if [ "$mnm" != "2" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_blacklist src -p udp -j RETURN >/dev/null 2>&1 || return 1; fi
+				if [ "$mnm" != "3" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_blacklist src -p udp -j RETURN >/dev/null 2>&1 || return 1; fi
 			fi
-			iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_blacklist src -p udp -j RETURN >/dev/null 2>&1
-			iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_blacklist src -p udp -j RETURN >/dev/null 2>&1
 
 			#2.白名单内再放行
 			if [ "$cirswitch" == "1" ]; then
 				echo_date "设置白名单进入merlinclash_CHN链" >> $LOG_FILE
-				iptables -t nat -A merlinclash -m set --match-set lan_mac_whitelist src -p tcp -j merlinclash_CHN
-				iptables -t nat -A merlinclash -m set --match-set lan_ip_whitelist src -p tcp -j merlinclash_CHN
+				if [ "$mnm" != "2" ]; then iptables -t nat -A merlinclash -m set --match-set lan_mac_whitelist src -p tcp -j merlinclash_CHN || return 1; fi
+				if [ "$mnm" != "3" ]; then iptables -t nat -A merlinclash -m set --match-set lan_ip_whitelist src -p tcp -j merlinclash_CHN || return 1; fi
 
 				if [ "$tproxymode" == "udp" ]; then
-						iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p udp  -j merlinclash
-						iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_whitelist src -p udp  -j merlinclash
+						if [ "$mnm" != "2" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p udp  -j merlinclash || return 1; fi
+						if [ "$mnm" != "3" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_whitelist src -p udp  -j merlinclash || return 1; fi
 				fi
 			else
 				echo_date "设置白名单进入merlinclash_NOR链" >> $LOG_FILE	
-				iptables -t nat -A merlinclash -m set --match-set lan_mac_whitelist src -p tcp -j merlinclash_NOR	
-				iptables -t nat -A merlinclash -m set --match-set lan_ip_whitelist src -p tcp -j merlinclash_NOR	
+				if [ "$mnm" != "2" ]; then iptables -t nat -A merlinclash -m set --match-set lan_mac_whitelist src -p tcp -j merlinclash_NOR || return 1; fi
+				if [ "$mnm" != "3" ]; then iptables -t nat -A merlinclash -m set --match-set lan_ip_whitelist src -p tcp -j merlinclash_NOR || return 1; fi
 				if [ "$tproxymode" == "udp" ]; then
-							iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p udp  -j merlinclash
-							iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_whitelist src -p udp  -j merlinclash
+							if [ "$mnm" != "2" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p udp  -j merlinclash || return 1; fi
+							if [ "$mnm" != "3" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_whitelist src -p udp  -j merlinclash || return 1; fi
 				fi
 			fi
 			#3.剩余主机处理
@@ -926,37 +947,37 @@ lan_bypass(){
 					#iptables写法
 					#大陆白判断
 					if [ "$cirswitch" == "1" ]; then				
-						iptables -t nat -A merlinclash -p tcp -j merlinclash_CHN
+						iptables -t nat -A merlinclash -p tcp -j merlinclash_CHN || return 1
 					else
-						iptables -t nat -A merlinclash -p tcp -j merlinclash_NOR
+						iptables -t nat -A merlinclash -p tcp -j merlinclash_NOR || return 1
 					fi
 					if [ "$dnshijacksel" == "1" ]; then
-						iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+						iptables -t nat -I PREROUTING -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1
 					fi
 					if [ "$dnsplan" == "fi" ]; then
 						if [ "$mnm" != "2" ]; then
-							iptables -t nat -I PREROUTING -m set --match-set macblacklist_dns src -p udp --dport 53 -j DNAT --to ${dfib} >/dev/null 2>&1
+							if [ "$mnm" != "2" ]; then iptables -t nat -I PREROUTING -m set --match-set macblacklist_dns src -p udp --dport 53 -j DNAT --to ${dfib} >/dev/null 2>&1 || return 1; fi
 						fi
 						if [ "$mnm" != "3" ]; then
-							iptables -t nat -I PREROUTING -m set --match-set ipblacklist_dns src -p udp --dport 53 -j DNAT --to ${dfib} >/dev/null 2>&1
+							if [ "$mnm" != "3" ]; then iptables -t nat -I PREROUTING -m set --match-set ipblacklist_dns src -p udp --dport 53 -j DNAT --to ${dfib} >/dev/null 2>&1 || return 1; fi
 						fi
 					fi
 					if [ "$tproxymode" == "udp" ]; then
-						iptables -t mangle -A merlinclash_PREROUTING -p udp -j merlinclash
+						iptables -t mangle -A merlinclash_PREROUTING -p udp -j merlinclash || return 1
 					fi
 				else  #剩余主机全端口不通过clash，只给通过clash的设备转发dns端口
 					echo_date "剩余主机全端口不通过clash，只给通过Clash的设备转发dns端口" >> $LOG_FILE
 					#iptables写法
 					if [ "$dnshijacksel" == "1" ]; then
 						if [ "$mnm" != "2" ]; then
-							iptables -t nat -I PREROUTING -m set --match-set macwhitelist_dns src -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+							if [ "$mnm" != "2" ]; then iptables -t nat -I PREROUTING -m set --match-set macwhitelist_dns src -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1; fi
 						fi
 						if [ "$mnm" != "3" ]; then
-							iptables -t nat -I PREROUTING -m set --match-set ipwhitelist_dns src -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+							if [ "$mnm" != "3" ]; then iptables -t nat -I PREROUTING -m set --match-set ipwhitelist_dns src -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1; fi
 						fi
 					fi
 					if [ "$tproxymode" == "udp" ]; then
-						iptables -t mangle -A merlinclash_PREROUTING -p udp -j RETURN #剩余主机udp流量都不转发
+						iptables -t mangle -A merlinclash_PREROUTING -p udp -j RETURN || return 1 #剩余主机udp流量都不转发
 					fi
 				fi
 			else 
@@ -966,32 +987,32 @@ lan_bypass(){
 					#iptables写法
 					#大陆白判断
 					if [ "$cirswitch" == "1" ]; then	
-						iptables -t nat -A merlinclash -p tcp -m multiport ! --dport $merlinclash_nokpacl_default_port -j RETURN			
-						iptables -t nat -A merlinclash -p tcp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash_CHN
+						iptables -t nat -A merlinclash -p tcp -m multiport ! --dport $merlinclash_nokpacl_default_port -j RETURN || return 1
+						iptables -t nat -A merlinclash -p tcp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash_CHN || return 1
 					else
-						iptables -t nat -A merlinclash -p tcp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash_NOR
+						iptables -t nat -A merlinclash -p tcp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash_NOR || return 1
 					fi						
 					if [ "$dnshijacksel" == "1" ]; then
-						iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+						iptables -t nat -I PREROUTING -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1
 					fi
 					if [ "$dnsplan" == "fi" ]; then
 						if [ "$mnm" != "2" ]; then
-							iptables -t nat -I PREROUTING -m set --match-set macblacklist_dns src -p udp --dport 53 -j DNAT --to ${dfib} >/dev/null 2>&1
+							if [ "$mnm" != "2" ]; then iptables -t nat -I PREROUTING -m set --match-set macblacklist_dns src -p udp --dport 53 -j DNAT --to ${dfib} >/dev/null 2>&1 || return 1; fi
 						fi
 						if [ "$mnm" != "3" ]; then
-							iptables -t nat -I PREROUTING -m set --match-set ipblacklist_dns src -p udp --dport 53 -j DNAT --to ${dfib} >/dev/null 2>&1
+							if [ "$mnm" != "3" ]; then iptables -t nat -I PREROUTING -m set --match-set ipblacklist_dns src -p udp --dport 53 -j DNAT --to ${dfib} >/dev/null 2>&1 || return 1; fi
 						fi
 					fi
 					if [ "$tproxymode" == "udp" ]; then
-						iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash
+						iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash || return 1
 					
 					fi
 				fi
 			fi
 			if [ "${merlinclash_ipt_proxyiot_sw}" != "1" ]; then
-				iptables -t nat -I PREROUTING -i br1 -j RETURN >/dev/null 2>&1
-				iptables -t nat -I PREROUTING -i br2 -j RETURN >/dev/null 2>&1
-				iptables -t nat -I PREROUTING -i br5+ -j RETURN >/dev/null 2>&1
+				iptables -t nat -I PREROUTING -i br1 -g merlinclash_RETURN >/dev/null 2>&1 || return 1
+				iptables -t nat -I PREROUTING -i br2 -g merlinclash_RETURN >/dev/null 2>&1 || return 1
+				iptables -t nat -I PREROUTING -i br5+ -g merlinclash_RETURN >/dev/null 2>&1 || return 1
 			fi
 		else
 			echo_date "未设置设备绕行，使用默认：全设备转发进Clash" >> $LOG_FILE
@@ -1003,48 +1024,48 @@ lan_bypass(){
 				#iptables写法
 				#大陆白判断
 				if [ "$cirswitch" == "1" ]; then				
-					iptables -t nat -A merlinclash -p tcp -j merlinclash_CHN
+					iptables -t nat -A merlinclash -p tcp -j merlinclash_CHN || return 1
 					if [ "$dnshijacksel" == "1" ]; then
-							iptables -t nat -I PREROUTING 3 -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1			
+							mc_insert_dns53 || return 1
 					fi
 				else
-					iptables -t nat -A merlinclash -p tcp -j merlinclash_NOR
+					iptables -t nat -A merlinclash -p tcp -j merlinclash_NOR || return 1
 					if [ "$dnshijacksel" == "1" ]; then
-						iptables -t nat -I PREROUTING 3 -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+						mc_insert_dns53 || return 1
 					fi
 				fi
 				if [ "$tproxymode" == "udp" ]; then
-						iptables -t mangle -A merlinclash_PREROUTING -p udp -j merlinclash
-						iptables -t mangle -I merlinclash_PREROUTING -p udp --dport 53 -j RETURN
+						iptables -t mangle -A merlinclash_PREROUTING -p udp -j merlinclash || return 1
+						iptables -t mangle -I merlinclash_PREROUTING -p udp --dport 53 -j RETURN || return 1
 				fi
 			else
 				echo_date 加载ACL规则：【全部主机】【$merlinclash_nokpacl_default_port】模式为：$(get_mode_name $merlinclash_nokpacl_default_mode) >> $LOG_FILE
 			
 				#大陆白判断
 				if [ "$cirswitch" == "1" ]; then
-					iptables -t nat -A merlinclash -p tcp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash_CHN
+					iptables -t nat -A merlinclash -p tcp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash_CHN || return 1
 					if [ "$dnshijacksel" == "1" ]; then
-						iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+						iptables -t nat -I PREROUTING -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1
 											
 					fi
 					if [ "$tproxymode" == "udp" ]; then
-							iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash
+							iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash || return 1
 					fi
 				else
-					iptables -t nat -A merlinclash -p tcp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash_NOR
+					iptables -t nat -A merlinclash -p tcp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash_NOR || return 1
 					if [ "$dnshijacksel" == "1" ]; then
-						iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+						iptables -t nat -I PREROUTING -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1
 					
 					fi
 					if [ "$tproxymode" == "udp" ]; then
-							iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash
+							iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash || return 1
 					fi
 				fi
 			fi
 			if [ "${merlinclash_ipt_proxyiot_sw}" != "1" ]; then
-				iptables -t nat -I PREROUTING -i br1 -j RETURN >/dev/null 2>&1
-				iptables -t nat -I PREROUTING -i br2 -j RETURN >/dev/null 2>&1
-				iptables -t nat -I PREROUTING -i br5+ -j RETURN >/dev/null 2>&1
+				iptables -t nat -I PREROUTING -i br1 -g merlinclash_RETURN >/dev/null 2>&1 || return 1
+				iptables -t nat -I PREROUTING -i br2 -g merlinclash_RETURN >/dev/null 2>&1 || return 1
+				iptables -t nat -I PREROUTING -i br5+ -g merlinclash_RETURN >/dev/null 2>&1 || return 1
 			fi
 		fi
 		dbus remove merlinclash_nokpacl_ip
@@ -1106,44 +1127,44 @@ lan_bypass(){
 				# echo_date "iptables优先处理访问自定端口走代理设备：$proxy_name" >> $LOG_FILE
 				if [ "$proxy_mode" == "1" ] && [ "$ports" != "" ]; then
 					echo_date "$proxy_name 访问指定端口【$ports】走代理" >> $LOG_FILE
-					iptables -t mangle -A merlinclash_PREROUTING $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p tcp $(factor $ports "-m multiport --dport") -j merlinclash
-					iptables -t mangle -A merlinclash_PREROUTING $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p tcp -j RETURN
+					iptables -t mangle -A merlinclash_PREROUTING $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p tcp $(factor $ports "-m multiport --dport") -j merlinclash || return 1
+					iptables -t mangle -A merlinclash_PREROUTING $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p tcp -j RETURN || return 1
 					if [ "$ipv6_flag" == "1" ]; then
-						ip6tables -t mangle -A merlinclash_PREROUTING $(factor $macaddr "-m mac --mac-source") -p tcp $(factor $ports "-m multiport --dport") -j merlinclash
-						ip6tables -t mangle -A merlinclash_PREROUTING $(factor $macaddr "-m mac --mac-source") -p tcp -j RETURN
+						ip6tables -t mangle -A merlinclash_PREROUTING $(factor $macaddr "-m mac --mac-source") -p tcp $(factor $ports "-m multiport --dport") -j merlinclash || return 1
+						ip6tables -t mangle -A merlinclash_PREROUTING $(factor $macaddr "-m mac --mac-source") -p tcp -j RETURN || return 1
 					fi
 					if [ "$tproxymode" == "tcpudp" ]; then
 						echo_date "同时开启Tproxy-TCP&UDP转发" >> $LOG_FILE
-						iptables -t mangle -A merlinclash_PREROUTING $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p udp $(factor $ports "-m multiport --dport") -j merlinclash
-						iptables -t mangle -A merlinclash_PREROUTING $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p udp -j RETURN
+						iptables -t mangle -A merlinclash_PREROUTING $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p udp $(factor $ports "-m multiport --dport") -j merlinclash || return 1
+						iptables -t mangle -A merlinclash_PREROUTING $(factor $ipaddr "-s") $(factor $macaddr "-m mac --mac-source") -p udp -j RETURN || return 1
 						
 						if [ "$ipv6_flag" == "1" ]; then
 							echo_date "同时开启Tproxy-TCP&UDP转发 | 开启IPV6" >> $LOG_FILE
-							ip6tables -t mangle -A merlinclash_PREROUTING $(factor $macaddr "-m mac --mac-source") -p udp $(factor $ports "-m multiport --dport") -j merlinclash
-							ip6tables -t mangle -A merlinclash_PREROUTING $(factor $macaddr "-m mac --mac-source") -p udp -j RETURN								
+							ip6tables -t mangle -A merlinclash_PREROUTING $(factor $macaddr "-m mac --mac-source") -p udp $(factor $ports "-m multiport --dport") -j merlinclash || return 1
+							ip6tables -t mangle -A merlinclash_PREROUTING $(factor $macaddr "-m mac --mac-source") -p udp -j RETURN || return 1
 						fi
 					fi
 				fi
 			done
 			if [ "$mnm" != "2" ]; then
-				ipset -! flush lan_mac_blacklist 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/lan_mac_blacklist.ipset 2>/dev/null
-				ipset -! flush macblacklist_dns 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/macblacklist_dns.ipset 2>/dev/null
-				ipset -! flush lan_mac_whitelist 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/lan_mac_whitelist.ipset 2>/dev/null
-				ipset -! flush macwhitelist_dns 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/macwhitelist_dns.ipset 2>/dev/null
+				ipset -! flush lan_mac_blacklist 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/lan_mac_blacklist.ipset 2>/dev/null || return 1
+				ipset -! flush macblacklist_dns 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/macblacklist_dns.ipset 2>/dev/null || return 1
+				ipset -! flush lan_mac_whitelist 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/lan_mac_whitelist.ipset 2>/dev/null || return 1
+				ipset -! flush macwhitelist_dns 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/macwhitelist_dns.ipset 2>/dev/null || return 1
 			fi
 			if [ "$mnm" != "3" ]; then
-				ipset -! flush lan_ip_blacklist 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/lan_ip_blacklist.ipset 2>/dev/null
-				ipset -! flush ipblacklist_dns 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/ipblacklist_dns.ipset 2>/dev/null
-				ipset -! flush lan_ip_whitelist 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/lan_ip_whitelist.ipset 2>/dev/null
-				ipset -! flush ipwhitelist_dns 2>/dev/null
-				ipset -! restore </jffs/softcenter/res/ipwhitelist_dns.ipset 2>/dev/null
+				ipset -! flush lan_ip_blacklist 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/lan_ip_blacklist.ipset 2>/dev/null || return 1
+				ipset -! flush ipblacklist_dns 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/ipblacklist_dns.ipset 2>/dev/null || return 1
+				ipset -! flush lan_ip_whitelist 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/lan_ip_whitelist.ipset 2>/dev/null || return 1
+				ipset -! flush ipwhitelist_dns 2>/dev/null || return 1
+				ipset -! restore </jffs/softcenter/res/ipwhitelist_dns.ipset 2>/dev/null || return 1
 			fi
 
 			#IPTABLES写法
@@ -1151,52 +1172,52 @@ lan_bypass(){
 			#iptables写法
 			echo_date "iptables处理中" >> $LOG_FILE		
 			echo_date "黑名单内先过滤" >> $LOG_FILE	
-			iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_blacklist src -p tcp -j RETURN >/dev/null 2>&1
-			iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_blacklist src -p tcp -j RETURN >/dev/null 2>&1
+			if [ "$mnm" != "2" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_blacklist src -p tcp -j RETURN >/dev/null 2>&1 || return 1; fi
+			if [ "$mnm" != "3" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_blacklist src -p tcp -j RETURN >/dev/null 2>&1 || return 1; fi
 							
 			if [ "$tproxymode" == "udp" ] || [ "$tproxymode" == "tcpudp" ]; then
-					iptables -t mangle -I merlinclash_PREROUTING -p udp --dport 53 -j RETURN
-					ip6tables -t mangle -I merlinclash_PREROUTING -p udp --dport 53 -j RETURN
+					iptables -t mangle -I merlinclash_PREROUTING -p udp --dport 53 -j RETURN || return 1
+					ip6tables -t mangle -I merlinclash_PREROUTING -p udp --dport 53 -j RETURN || return 1
 			fi
 			if [ "$ipv6_flag" == "1" ]; then
-				ip6tables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_blacklist src -p tcp -j RETURN >/dev/null 2>&1
+				if [ "$mnm" != "2" ]; then ip6tables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_blacklist src -p tcp -j RETURN >/dev/null 2>&1 || return 1; fi
 			fi
 			#20201122
 			if [ "$tproxymode" == "tcpudp" ]; then
-				iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_blacklist src -p udp -j RETURN >/dev/null 2>&1
-				iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_blacklist src -p udp -j RETURN >/dev/null 2>&1
+				if [ "$mnm" != "2" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_blacklist src -p udp -j RETURN >/dev/null 2>&1 || return 1; fi
+				if [ "$mnm" != "3" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_blacklist src -p udp -j RETURN >/dev/null 2>&1 || return 1; fi
 				if [ "$ipv6_flag" == "1" ]; then
-					ip6tables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_blacklist src -p udp -j RETURN >/dev/null 2>&1
+					if [ "$mnm" != "2" ]; then ip6tables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_blacklist src -p udp -j RETURN >/dev/null 2>&1 || return 1; fi
 				fi
 			fi
 			#2.白名单内再放行
 			echo_date "白名单内再放行" >> $LOG_FILE	
 			if [ "$cirswitch" == "1" ]; then	
-				iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p tcp -j merlinclash
-				iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_whitelist src -p tcp -j merlinclash
+				if [ "$mnm" != "2" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p tcp -j merlinclash || return 1; fi
+				if [ "$mnm" != "3" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_whitelist src -p tcp -j merlinclash || return 1; fi
 			
 				if [ "$ipv6_flag" == "1" ]; then
-					ip6tables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p tcp -j merlinclash
+					if [ "$mnm" != "2" ]; then ip6tables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p tcp -j merlinclash || return 1; fi
 				fi
 				if [ "$tproxymode" == "tcpudp" ]; then
-						iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p udp -j merlinclash
-						iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_whitelist src -p udp -j merlinclash
+						if [ "$mnm" != "2" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p udp -j merlinclash || return 1; fi
+						if [ "$mnm" != "3" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_whitelist src -p udp -j merlinclash || return 1; fi
 					if [ "$ipv6_flag" == "1" ]; then
-						ip6tables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p udp -j merlinclash				
+						if [ "$mnm" != "2" ]; then ip6tables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p udp -j merlinclash || return 1; fi
 					fi
 				fi
 			else
-				iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p tcp -j merlinclash
-				iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_whitelist src -p tcp -j merlinclash
+				if [ "$mnm" != "2" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p tcp -j merlinclash || return 1; fi
+				if [ "$mnm" != "3" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_whitelist src -p tcp -j merlinclash || return 1; fi
 				
 				if [ "$ipv6_flag" == "1" ]; then
-					ip6tables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p tcp -j merlinclash				
+					if [ "$mnm" != "2" ]; then ip6tables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p tcp -j merlinclash || return 1; fi
 				fi
 				if [ "$tproxymode" == "tcpudp" ]; then
-						iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p udp -j merlinclash
-						iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_whitelist src -p udp -j merlinclash
+						if [ "$mnm" != "2" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p udp -j merlinclash || return 1; fi
+						if [ "$mnm" != "3" ]; then iptables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_ip_whitelist src -p udp -j merlinclash || return 1; fi
 					if [ "$ipv6_flag" == "1" ]; then
-						ip6tables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p udp -j merlinclash
+						if [ "$mnm" != "2" ]; then ip6tables -t mangle -A merlinclash_PREROUTING -m set --match-set lan_mac_whitelist src -p udp -j merlinclash || return 1; fi
 					fi
 				fi
 			fi
@@ -1210,21 +1231,21 @@ lan_bypass(){
 					#iptables写法
 					#大陆白判断
 						if [ "$dnshijacksel" == "1" ]; then
-							iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+							iptables -t nat -I PREROUTING -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1
 						
 							if [ "$dnsplan" == "fi" ]; then
-								iptables -t nat -I PREROUTING -m set --match-set macblacklist_dns src -p udp --dport 53 -j DNAT --to ${dfib} >/dev/null 2>&1
+								if [ "$mnm" != "2" ]; then iptables -t nat -I PREROUTING -m set --match-set macblacklist_dns src -p udp --dport 53 -j DNAT --to ${dfib} >/dev/null 2>&1 || return 1; fi
 							fi
 						
 						fi
-						iptables -t mangle -A merlinclash_PREROUTING -p tcp -j merlinclash
+						iptables -t mangle -A merlinclash_PREROUTING -p tcp -j merlinclash || return 1
 						if [ "$ipv6_flag" == "1" ]; then
-							ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -j merlinclash
+							ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -j merlinclash || return 1
 						fi
 						if [ "$tproxymode" == "tcpudp" ]; then
-							iptables -t mangle -A merlinclash_PREROUTING -p udp -j merlinclash
+							iptables -t mangle -A merlinclash_PREROUTING -p udp -j merlinclash || return 1
 								if [ "$ipv6_flag" == "1" ]; then
-									ip6tables -t mangle -A merlinclash_PREROUTING -p udp -j merlinclash
+									ip6tables -t mangle -A merlinclash_PREROUTING -p udp -j merlinclash || return 1
 								fi
 						fi 
 				else  #剩余主机全端口不通过clash，只给通过clash的设备转发dns端口
@@ -1232,10 +1253,10 @@ lan_bypass(){
 					#iptables写法
 					if [ "$dnshijacksel" == "1" ]; then
 						if [ "$mnm" != "2" ]; then
-							iptables -t nat -I PREROUTING -m set --match-set macwhitelist_dns src -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+							if [ "$mnm" != "2" ]; then iptables -t nat -I PREROUTING -m set --match-set macwhitelist_dns src -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1; fi
 						fi
 						if [ "$mnm" != "3" ]; then
-							iptables -t nat -I PREROUTING -m set --match-set ipwhitelist_dns src -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+							if [ "$mnm" != "3" ]; then iptables -t nat -I PREROUTING -m set --match-set ipwhitelist_dns src -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1; fi
 						fi
 					fi
 				fi
@@ -1246,46 +1267,46 @@ lan_bypass(){
 					#iptables写法
 					#大陆白判断
 					if [ "$cirswitch" == "1" ]; then				
-						iptables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash
+						iptables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash || return 1
 						if [ "$ipv6_flag" == "1" ]; then
-							ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash
+							ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash || return 1
 						fi
 						if [ "$dnshijacksel" == "1" ]; then
-							iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+							iptables -t nat -I PREROUTING -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1
 						
 							if [ "$dnsplan" == "fi" ]; then
-								iptables -t nat -I PREROUTING -m set --match-set macblacklist_dns src -p udp --dport 53 -j DNAT --to ${dfib} >/dev/null 2>&1
+								if [ "$mnm" != "2" ]; then iptables -t nat -I PREROUTING -m set --match-set macblacklist_dns src -p udp --dport 53 -j DNAT --to ${dfib} >/dev/null 2>&1 || return 1; fi
 							fi
 					
 						fi
 						if [ "$tproxymode" == "tcpudp" ]; then
-							iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash
+							iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash || return 1
 							if [ "$ipv6_flag" == "1" ]; then
-								ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash
+								ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash || return 1
 							fi
 						fi
 					else
-						iptables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash
+						iptables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash || return 1
 						if [ "$ipv6_flag" == "1" ]; then
-							ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash
+							ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash || return 1
 						fi
 						if [ "$dnshijacksel" == "1" ]; then
-							iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+							iptables -t nat -I PREROUTING -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1
 						
 						fi
 						if [ "$tproxymode" == "tcpudp" ]; then
-							iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash
+							iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash || return 1
 							if [ "$ipv6_flag" == "1" ]; then
-								ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash
+								ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port -j merlinclash || return 1
 							fi
 						fi
 					fi
 				fi
 			fi
 			if [ "${merlinclash_ipt_proxyiot_sw}" != "1" ]; then
-				iptables -t nat -I PREROUTING -i br1 -j RETURN >/dev/null 2>&1
-				iptables -t nat -I PREROUTING -i br2 -j RETURN >/dev/null 2>&1
-				iptables -t nat -I PREROUTING -i br5+ -j RETURN >/dev/null 2>&1
+				iptables -t nat -I PREROUTING -i br1 -g merlinclash_RETURN >/dev/null 2>&1 || return 1
+				iptables -t nat -I PREROUTING -i br2 -g merlinclash_RETURN >/dev/null 2>&1 || return 1
+				iptables -t nat -I PREROUTING -i br5+ -g merlinclash_RETURN >/dev/null 2>&1 || return 1
 			fi
 		else
 			echo_date "未设置设备绕行，采用默认规则：clash全设备通行" >> $LOG_FILE
@@ -1295,59 +1316,59 @@ lan_bypass(){
 				merlinclash_nokpacl_default_port=""
 				echo_date 加载ACl规则：【全部主机】【全部端口】模式为：$(get_mode_name $merlinclash_nokpacl_default_mode) >> $LOG_FILE
 				#iptables写法
-					iptables -t mangle -A merlinclash_PREROUTING -p tcp -j merlinclash
+					iptables -t mangle -A merlinclash_PREROUTING -p tcp -j merlinclash || return 1
 					if [ "$dnshijacksel" == "1" ]; then
-						iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+						iptables -t nat -I PREROUTING -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1
 					fi
 					if [ "$tproxymode" == "tcpudp" ]; then
-						iptables -t mangle -A merlinclash_PREROUTING -p udp -j merlinclash
-						iptables -t mangle -I merlinclash_PREROUTING -p udp --dport 53 -j RETURN
+						iptables -t mangle -A merlinclash_PREROUTING -p udp -j merlinclash || return 1
+						iptables -t mangle -I merlinclash_PREROUTING -p udp --dport 53 -j RETURN || return 1
 					fi
 					if [ "$ipv6_flag" == "1" ]; then
-						ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -j merlinclash
+						ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -j merlinclash || return 1
 							if [ "$tproxymode" == "tcpudp" ]; then
-								ip6tables -t mangle -A merlinclash_PREROUTING -p udp -j merlinclash
-								ip6tables -t mangle -I merlinclash_PREROUTING -p udp --dport 53 -j RETURN
+								ip6tables -t mangle -A merlinclash_PREROUTING -p udp -j merlinclash || return 1
+								ip6tables -t mangle -I merlinclash_PREROUTING -p udp --dport 53 -j RETURN || return 1
 							fi
 					fi
 			else
 				echo_date 加载ACL规则：【全部主机】【$merlinclash_nokpacl_default_port】模式为：$(get_mode_name $merlinclash_nokpacl_default_mode) >> $LOG_FILE
 				#大陆白判断
 				if [ "$cirswitch" == "1" ]; then
-					iptables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash
+					iptables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash || return 1
 					if [ "$ipv6_flag" == "1" ]; then
-						ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash
+						ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash || return 1
 					fi
 					if [ "$dnshijacksel" == "1" ]; then
-						iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+						iptables -t nat -I PREROUTING -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1
 					fi
 					if [ "$tproxymode" == "tcpudp" ]; then
-						iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash
+						iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash || return 1
 						if [ "$ipv6_flag" == "1" ]; then
-							ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash
+							ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash || return 1
 						fi
 					fi
 				else
-					iptables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash
+					iptables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash || return 1
 					if [ "$ipv6_flag" == "1" ]; then
-						ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash
+						ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash || return 1
 					fi
 					if [ "$dnshijacksel" == "1" ]; then
-						iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-port 53 >/dev/null 2>&1
+						iptables -t nat -I PREROUTING -p udp --dport 53 -j merlinclash_DNS53 >/dev/null 2>&1 || return 1
 					fi
 					if [ "$tproxymode" == "tcpudp" ]; then
-						iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash
+						iptables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash || return 1
 						if [ "$ipv6_flag" == "1" ]; then
-							ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash
+							ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m multiport --dport $merlinclash_nokpacl_default_port  -j merlinclash || return 1
 						fi
 					fi
 				fi
 				
 			fi
 			if [ "${merlinclash_ipt_proxyiot_sw}" != "1" ]; then
-				iptables -t nat -I PREROUTING -i br1 -j RETURN >/dev/null 2>&1
-				iptables -t nat -I PREROUTING -i br2 -j RETURN >/dev/null 2>&1
-				iptables -t nat -I PREROUTING -i br5+ -j RETURN >/dev/null 2>&1
+				iptables -t nat -I PREROUTING -i br1 -g merlinclash_RETURN >/dev/null 2>&1 || return 1
+				iptables -t nat -I PREROUTING -i br2 -g merlinclash_RETURN >/dev/null 2>&1 || return 1
+				iptables -t nat -I PREROUTING -i br5+ -g merlinclash_RETURN >/dev/null 2>&1 || return 1
 			fi
 		fi
 		dbus remove merlinclash_nokpacl_ip
@@ -1359,6 +1380,17 @@ lan_bypass(){
 }
 
 apply_nat_rules() {
+    mc_ensure_policy_rule() {
+        local family="$1" mark="$2" snapshot
+        snapshot=$(ip "$family" rule show 2>/dev/null) || return 1
+        if printf '%s\n' "$snapshot" | awk -v mark="$mark" '
+            NF==7 && $1 ~ /^[0-9]+:$/ && $2=="from" && $3=="all" && $4=="fwmark" && $6=="lookup" && $7=="233" {
+                value=$5; sub(/\/0xffffffff$/,"",value); if(value==mark) found=1
+            }
+            END {exit(found ? 0 : 1)}
+        '; then return 0; fi
+        ip "$family" rule add from all fwmark "$mark/0xffffffff" lookup 233 || return 1
+    }
 	dem2=$(yq eval ".enhanced-mode" "$yamlpath" 2>/dev/null)
 	echo_date "开始写入iptable规则" >> $LOG_FILE
 
@@ -1371,115 +1403,105 @@ apply_nat_rules() {
 			ipv6_flag="1"
 			echo_date "IPV6-DNS兼容处理" >> $LOG_FILE
 		fi
-		iptables -t nat -N merlinclash
+		iptables -t nat -N merlinclash 2>/dev/null || iptables -t nat -S merlinclash >/dev/null 2>&1 || return 1
 		echo_date "创建【nat】表【merlinclash】链" >> $LOG_FILE	
-		iptables -t nat -N merlinclash_EXT
+		iptables -t nat -N merlinclash_EXT 2>/dev/null || iptables -t nat -S merlinclash_EXT >/dev/null 2>&1 || return 1
 		echo_date "创建【nat】表【merlinclash_EXT】链" >> $LOG_FILE
 		#ip集强制绕过
-		iptables -t nat -A merlinclash -p tcp -m set --match-set ipset_proxyarround dst -j RETURN
+		iptables -t nat -A merlinclash -p tcp -m set --match-set ipset_proxyarround dst -j RETURN || return 1
 		#局域网&排除地址绕行
-		iptables -t nat -A merlinclash -p tcp -m set --match-set direct_list dst -j RETURN
-		iptables -t nat -A merlinclash_EXT -p tcp -m set --match-set direct_list dst -j RETURN
+		iptables -t nat -A merlinclash -p tcp -m set --match-set direct_list dst -j RETURN || return 1
+		iptables -t nat -A merlinclash_EXT -p tcp -m set --match-set direct_list dst -j RETURN || return 1
 		# 创建redirhost常规模式nat rule
 		
-		iptables -t nat -N merlinclash_NOR
+		iptables -t nat -N merlinclash_NOR 2>/dev/null || iptables -t nat -S merlinclash_NOR >/dev/null 2>&1 || return 1
 		echo_date "创建【nat】表【merlinclash_NOR】链" >> $LOG_FILE
 		#ip集强制代理
-		iptables -t nat -A merlinclash_NOR -p tcp -m set --match-set ipset_proxy dst -j REDIRECT --to-ports $proxy_port
-		iptables -t nat -A merlinclash_NOR -p tcp -j REDIRECT --to-ports $proxy_port
+		iptables -t nat -A merlinclash_NOR -p tcp -m set --match-set ipset_proxy dst -j REDIRECT --to-ports $proxy_port || return 1
+		iptables -t nat -A merlinclash_NOR -p tcp -j REDIRECT --to-ports $proxy_port || return 1
 		# 创建redirhost大陆白名单模式nat rule
 		
-		iptables -t nat -N merlinclash_CHN
+		iptables -t nat -N merlinclash_CHN 2>/dev/null || iptables -t nat -S merlinclash_CHN >/dev/null 2>&1 || return 1
 		echo_date "创建【nat】表【merlinclash_CHN】链" >> $LOG_FILE
 		#ip集强制代理
-		iptables -t nat -A merlinclash_CHN -p tcp -m set --match-set ipset_proxy dst -j REDIRECT --to-ports $proxy_port
-		iptables -t nat -A merlinclash_CHN -p tcp -m set ! --match-set china_ip_route dst -j REDIRECT --to-ports $proxy_port
+		iptables -t nat -A merlinclash_CHN -p tcp -m set --match-set ipset_proxy dst -j REDIRECT --to-ports $proxy_port || return 1
+		iptables -t nat -A merlinclash_CHN -p tcp -m set ! --match-set china_ip_route dst -j REDIRECT --to-ports $proxy_port || return 1
 		
 		if [ "$tproxymode" == "udp" ]; then
 			echo_date "开启【TProxy UDP】转发，将创建相关iptable规则" >> $LOG_FILE
 			# udp
-			load_tproxy
+			load_tproxy || return 1
 			# 设置策略路由
-			ip -4 route add local default dev lo table 233
-			ip -4 rule add fwmark 0x2333         table 233
+			ip -4 route replace local default dev lo table 233 || return 1
+			mc_ensure_policy_rule -4 0x2333 || return 1
 			#同步路由家长电脑控制
-			iptables -t filter -S PControls | while read -r line; do iptables -t mangle $line; done
-			iptables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g'|while read -r line; do iptables -t mangle $line; done
+			iptables -t filter -S PControls | sed 's/PControls/MC_PControls/g' | while read -r line; do iptables -t mangle $line || return 1; done || return 1
+			iptables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g;s/PControls/MC_PControls/g'|while read -r line; do iptables -t mangle $line || return 1; done || return 1
 
 			#添加merlinclash_PREROUTING链
-			iptables -t mangle -N merlinclash_PREROUTING
-			iptables -t mangle -F merlinclash_PREROUTING
+			iptables -t mangle -N merlinclash_PREROUTING 2>/dev/null || iptables -t mangle -S merlinclash_PREROUTING >/dev/null 2>&1 || return 1
+			iptables -t mangle -F merlinclash_PREROUTING || return 1
             
 			#仅对首包进行判断是否走clash，对转发的链接打上mark
-			iptables -t mangle -N merlinclash
-			iptables -t mangle -F merlinclash
-			iptables -t mangle -A merlinclash -m conntrack --ctstate NEW -j MARK --set-mark 0x2333
-            iptables -t mangle -A merlinclash -j CONNMARK --save-mark
-            iptables -t mangle -A merlinclash -p udp -m mark --mark 0x2333 -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port
+			iptables -t mangle -N merlinclash 2>/dev/null || iptables -t mangle -S merlinclash >/dev/null 2>&1 || return 1
+			iptables -t mangle -F merlinclash || return 1
+			iptables -t mangle -A merlinclash -m conntrack --ctstate NEW -j MARK --set-mark 0x2333 || return 1
+            iptables -t mangle -A merlinclash -j CONNMARK --save-mark || return 1
+            iptables -t mangle -A merlinclash -p udp -m mark --mark 0x2333 -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port || return 1
             
 			#非首包有mark直接转发，无mark直连不再进行黑白名单及acl判断
-			iptables -t mangle -N merlinclash_divert
-			iptables -t mangle -F merlinclash_divert
-			iptables -t mangle -A merlinclash_divert -j CONNMARK --restore-mark
-            iptables -t mangle -A merlinclash_divert -p udp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port
-            iptables -t mangle -A merlinclash_divert -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-            iptables -t mangle -A merlinclash_divert -m conntrack --ctstate INVALID -j DROP
+			iptables -t mangle -N merlinclash_divert 2>/dev/null || iptables -t mangle -S merlinclash_divert >/dev/null 2>&1 || return 1
+			iptables -t mangle -F merlinclash_divert || return 1
+			iptables -t mangle -A merlinclash_divert -j CONNMARK --restore-mark || return 1
+            iptables -t mangle -A merlinclash_divert -p udp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port || return 1
+            iptables -t mangle -A merlinclash_divert -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || return 1
+            iptables -t mangle -A merlinclash_divert -m conntrack --ctstate INVALID -j DROP || return 1
 				
 			if [ "${merlinclash_ipt_proxyiot_sw}" != "1" ]; then
-				iptables -t mangle -A merlinclash_PREROUTING -i br1 -j RETURN
-				iptables -t mangle -A merlinclash_PREROUTING -i br2 -j RETURN
-				iptables -t mangle -A merlinclash_PREROUTING -i br5+ -j RETURN
+				iptables -t mangle -A merlinclash_PREROUTING -i br1 -j RETURN || return 1
+				iptables -t mangle -A merlinclash_PREROUTING -i br2 -j RETURN || return 1
+				iptables -t mangle -A merlinclash_PREROUTING -i br5+ -j RETURN || return 1
 			fi
 			#ip集强制代理
-			iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set ipset_proxy dst -j merlinclash
+			iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set ipset_proxy dst -j merlinclash || return 1
 			#ip集强制绕过
-			iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set ipset_proxyarround dst -j RETURN
+			iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set ipset_proxyarround dst -j RETURN || return 1
 			#局域网&排除地址绕行
-			iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set direct_list dst -j RETURN
+			iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set direct_list dst -j RETURN || return 1
 			if [ "$cirswitch" == "1" ]; then	
-				iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set china_ip_route dst -j RETURN
+				iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set china_ip_route dst -j RETURN || return 1
 			fi
-			iptables -t mangle -A PREROUTING -p udp -j merlinclash_divert
-			iptables -t mangle -A PREROUTING -p udp -j merlinclash_PREROUTING			
+			iptables -t mangle -A PREROUTING -p udp -j merlinclash_divert || return 1
+			iptables -t mangle -A PREROUTING -p udp -j merlinclash_PREROUTING || return 1
 		else
 			echo_date "【检测到UDP转发关闭，进行下一步】" >> $LOG_FILE
 		fi
-		echo_date "清除wanduck监听规则" >> $LOG_FILE
-		wanduck1_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/18017/=' | sort -r)
-		for wanduck1_index in $wanduck1_indexs; do
-			iptables -t nat -D PREROUTING $wanduck1_index >/dev/null 2>&1
-		done
-		wanduck2_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/18018/=' | sort -r)
-		for wanduck2_index in $wanduck2_indexs; do
-			iptables -t nat -D PREROUTING $wanduck2_index >/dev/null 2>&1
-		done
 
-		lan_bypass
-
-		iptables -t nat -A OUTPUT -p tcp -m mark --mark "$ip_prefix_hex" -j merlinclash_EXT
-		iptables -t nat -A OUTPUT -p tcp -m mark --mark "$opvpn_prefix_hex" -j merlinclash_EXT #OPENVPN回城兼容
-		iptables -t nat -A OUTPUT -p tcp -m mark --mark "$pptpvpn_prefix_hex" -j merlinclash_EXT #PPTPVPN回城兼容
-		iptables -t nat -A OUTPUT -p tcp -m mark --mark "$ipsec_prefix_hex" -j merlinclash_EXT #PPTPVPN回城兼容
-		iptables -t nat -A merlinclash_EXT -p tcp -j merlinclash
+		lan_bypass || return 1
+		iptables -t nat -A OUTPUT -p tcp -m mark --mark "$ip_prefix_hex" -j merlinclash_EXT || return 1
+		iptables -t nat -A OUTPUT -p tcp -m mark --mark "$opvpn_prefix_hex" -j merlinclash_EXT || return 1 #OPENVPN回城兼容
+		iptables -t nat -A OUTPUT -p tcp -m mark --mark "$pptpvpn_prefix_hex" -j merlinclash_EXT || return 1 #PPTPVPN回城兼容
+		iptables -t nat -A OUTPUT -p tcp -m mark --mark "$ipsec_prefix_hex" -j merlinclash_EXT || return 1 #PPTPVPN回城兼容
+		iptables -t nat -A merlinclash_EXT -p tcp -j merlinclash || return 1
 		
 				
 		if [ "$dnsgoclash" == "1" ]; then
 			#转发路由器自身tcp流量，clash出站流量打了mark不转发，避免回环
-			iptables -t nat -N merlinclash_OUTPUT
-            iptables -t nat -A merlinclash_OUTPUT -p tcp -m set --match-set direct_list dst -j RETURN
-			iptables -t nat -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN
+			iptables -t nat -N merlinclash_OUTPUT 2>/dev/null || iptables -t nat -S merlinclash_OUTPUT >/dev/null 2>&1 || return 1
+            iptables -t nat -A merlinclash_OUTPUT -p tcp -m set --match-set direct_list dst -j RETURN || return 1
+			iptables -t nat -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN || return 1
 			if [ "$cirswitch" == "1" ]; then	
-				iptables -t nat -A merlinclash_OUTPUT -p tcp -m set ! --match-set china_ip_route dst -j merlinclash
+				iptables -t nat -A merlinclash_OUTPUT -p tcp -m set ! --match-set china_ip_route dst -j merlinclash || return 1
 			else
-				iptables -t nat -A merlinclash_OUTPUT -p tcp -j merlinclash
+				iptables -t nat -A merlinclash_OUTPUT -p tcp -j merlinclash || return 1
 			fi
-			iptables -t nat -A merlinclash_OUTPUT -p udp --dport 53 -j REDIRECT --to-port 53
-			iptables -t nat -I OUTPUT -j merlinclash_OUTPUT		
+			iptables -t nat -A merlinclash_OUTPUT -p udp --dport 53 -j REDIRECT --to-port 53 || return 1
+			iptables -t nat -I OUTPUT -j merlinclash_OUTPUT || return 1
 				
 		fi
 		
 
-		iptables -t nat -A PREROUTING -p tcp -j merlinclash
+		iptables -t nat -A PREROUTING -p tcp -j merlinclash || return 1
 		
 	
 	elif [ "$tproxymode" == "tcpudp" ]; then 
@@ -1492,205 +1514,187 @@ apply_nat_rules() {
 		fi
 
 		# ipv4设置策略路由
-		load_tproxy
-		ip -4 route add local default dev lo table 233
-		ip -4 rule add fwmark 0x2333         table 233
+		load_tproxy || return 1
+		ip -4 route replace local default dev lo table 233 || return 1
+		mc_ensure_policy_rule -4 0x2333 || return 1
 
 		#同步路由家长电脑控制
-		iptables -t filter -S PControls | while read -r line; do iptables -t mangle $line; done
-		iptables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g'|while read -r line; do iptables -t mangle $line; done
+		iptables -t filter -S PControls | sed 's/PControls/MC_PControls/g' | while read -r line; do iptables -t mangle $line || return 1; done || return 1
+		iptables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g;s/PControls/MC_PControls/g'|while read -r line; do iptables -t mangle $line || return 1; done || return 1
 
 		#添加merlinclash_PREROUTING链
-		iptables -t mangle -N merlinclash_PREROUTING
-		iptables -t mangle -F merlinclash_PREROUTING
+		iptables -t mangle -N merlinclash_PREROUTING 2>/dev/null || iptables -t mangle -S merlinclash_PREROUTING >/dev/null 2>&1 || return 1
+		iptables -t mangle -F merlinclash_PREROUTING || return 1
 
 		#仅对首包进行判断是否走clash，对转发的链接打上mark
-		iptables -t mangle -N merlinclash
-		iptables -t mangle -F merlinclash
-		iptables -t mangle -A merlinclash -m conntrack --ctstate NEW -j MARK --set-mark 0x2333
-        iptables -t mangle -A merlinclash -j CONNMARK --save-mark
-		iptables -t mangle -A merlinclash -p tcp -m mark --mark 0x2333 -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port
-        iptables -t mangle -A merlinclash -p udp -m mark --mark 0x2333 -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port
+		iptables -t mangle -N merlinclash 2>/dev/null || iptables -t mangle -S merlinclash >/dev/null 2>&1 || return 1
+		iptables -t mangle -F merlinclash || return 1
+		iptables -t mangle -A merlinclash -m conntrack --ctstate NEW -j MARK --set-mark 0x2333 || return 1
+        iptables -t mangle -A merlinclash -j CONNMARK --save-mark || return 1
+		iptables -t mangle -A merlinclash -p tcp -m mark --mark 0x2333 -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port || return 1
+        iptables -t mangle -A merlinclash -p udp -m mark --mark 0x2333 -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port || return 1
             
 		#非首包有mark直接转发，无mark直连不再进行黑白名单及acl判断
-		iptables -t mangle -N merlinclash_divert
-		iptables -t mangle -F merlinclash_divert
-		iptables -t mangle -A merlinclash_divert -j CONNMARK --restore-mark
-		iptables -t mangle -A merlinclash_divert -p tcp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port
-        iptables -t mangle -A merlinclash_divert -p udp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port
-        iptables -t mangle -A merlinclash_divert -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-        iptables -t mangle -A merlinclash_divert -m conntrack --ctstate INVALID -j DROP
+		iptables -t mangle -N merlinclash_divert 2>/dev/null || iptables -t mangle -S merlinclash_divert >/dev/null 2>&1 || return 1
+		iptables -t mangle -F merlinclash_divert || return 1
+		iptables -t mangle -A merlinclash_divert -j CONNMARK --restore-mark || return 1
+		iptables -t mangle -A merlinclash_divert -p tcp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port || return 1
+        iptables -t mangle -A merlinclash_divert -p udp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port || return 1
+        iptables -t mangle -A merlinclash_divert -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || return 1
+        iptables -t mangle -A merlinclash_divert -m conntrack --ctstate INVALID -j DROP || return 1
 
 		#echo_date "创建【mangle】表【merlinclash】链" >> $LOG_FILE
 		if [ "${merlinclash_ipt_proxyiot_sw}" != "1" ]; then
-			iptables -t mangle -A merlinclash_PREROUTING -i br1 -j RETURN
-			iptables -t mangle -A merlinclash_PREROUTING -i br2 -j RETURN
-			iptables -t mangle -A merlinclash_PREROUTING -i br5+ -j RETURN
+			iptables -t mangle -A merlinclash_PREROUTING -i br1 -j RETURN || return 1
+			iptables -t mangle -A merlinclash_PREROUTING -i br2 -j RETURN || return 1
+			iptables -t mangle -A merlinclash_PREROUTING -i br5+ -j RETURN || return 1
 		fi
 		#ip集强制代理
-		iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxy dst --syn -j merlinclash
-		iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set ipset_proxy dst -m conntrack --ctstate NEW -j merlinclash
+		iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxy dst --syn -j merlinclash || return 1
+		iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set ipset_proxy dst -m conntrack --ctstate NEW -j merlinclash || return 1
 		#iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set router dst -j merlinclash
 		#ip集强制绕过
-		iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxyarround dst -j RETURN
-		iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set ipset_proxyarround dst -j RETURN
+		iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxyarround dst -j RETURN || return 1
+		iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set ipset_proxyarround dst -j RETURN || return 1
 		#局域网&排除地址绕行
-		iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set direct_list dst -j RETURN
-		iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set direct_list dst -j RETURN
+		iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set direct_list dst -j RETURN || return 1
+		iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set direct_list dst -j RETURN || return 1
 		#
 		if [ "$cirswitch" == "1" ]; then
-			iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set china_ip_route dst -j RETURN	
-			iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set china_ip_route dst -j RETURN											
+			iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set china_ip_route dst -j RETURN || return 1
+			iptables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set china_ip_route dst -j RETURN || return 1
 		fi
 											
 		if [ "$ipv6_flag" == "0" ]; then
-			echo_date "清除wanduck监听规则" >> $LOG_FILE
-			wanduck1_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/18017/=' | sort -r)
-			for wanduck1_index in $wanduck1_indexs; do
-				iptables -t nat -D PREROUTING $wanduck1_index >/dev/null 2>&1
-			done
-			wanduck2_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/18018/=' | sort -r)
-			for wanduck2_index in $wanduck2_indexs; do
-				iptables -t nat -D PREROUTING $wanduck2_index >/dev/null 2>&1
-			done
-			lan_bypass
-			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_divert
-			iptables -t mangle -A PREROUTING -p udp -j merlinclash_divert
-			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_PREROUTING
-			iptables -t mangle -A PREROUTING -p udp -j merlinclash_PREROUTING
+			lan_bypass || return 1
+			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_divert || return 1
+			iptables -t mangle -A PREROUTING -p udp -j merlinclash_divert || return 1
+			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_PREROUTING || return 1
+			iptables -t mangle -A PREROUTING -p udp -j merlinclash_PREROUTING || return 1
 			
 		fi		
 	    # ipv6设置策略路由
 		if [ "$ipv6_flag" == "1" ]; then
-			echo_date "清除wanduck监听规则" >> $LOG_FILE
-			wanduck1_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/18017/=' | sort -r)
-			for wanduck1_index in $wanduck1_indexs; do
-				iptables -t nat -D PREROUTING $wanduck1_index >/dev/null 2>&1
-			done
-			wanduck2_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/18018/=' | sort -r)
-			for wanduck2_index in $wanduck2_indexs; do
-				iptables -t nat -D PREROUTING $wanduck2_index >/dev/null 2>&1
-			done
 
-			ip -6 route add local default dev lo table 233
-			ip -6 rule add fwmark 0x2333         table 233
+			ip -6 route replace local default dev lo table 233 || return 1
+			mc_ensure_policy_rule -6 0x2333 || return 1
 
 			#同步路由家长电脑控制
-			ip6tables -t filter -S PControls | while read -r line; do ip6tables -t mangle $line; done
-			ip6tables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g'|while read -r line; do ip6tables -t mangle $line; done
+			ip6tables -t filter -S PControls | sed 's/PControls/MC_PControls/g' | while read -r line; do ip6tables -t mangle $line || return 1; done || return 1
+			ip6tables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g;s/PControls/MC_PControls/g'|while read -r line; do ip6tables -t mangle $line || return 1; done || return 1
 
 			#添加merlinclash_PREROUTING链
-			ip6tables -t mangle -N merlinclash_PREROUTING
-			ip6tables -t mangle -F merlinclash_PREROUTING
+			ip6tables -t mangle -N merlinclash_PREROUTING 2>/dev/null || ip6tables -t mangle -S merlinclash_PREROUTING >/dev/null 2>&1 || return 1
+			ip6tables -t mangle -F merlinclash_PREROUTING || return 1
 
 			#仅对首包进行判断是否走clash，对转发的链接打上mark
-			ip6tables -t mangle -N merlinclash
-			ip6tables -t mangle -F merlinclash
-			ip6tables -t mangle -A merlinclash -m conntrack --ctstate NEW -j MARK --set-mark 0x2333
-            ip6tables -t mangle -A merlinclash -j CONNMARK --save-mark
-			ip6tables -t mangle -A merlinclash -p tcp -m mark --mark 0x2333 -j TPROXY --on-ip ::1 --on-port $tproxy_port
-            ip6tables -t mangle -A merlinclash -p udp -m mark --mark 0x2333 -j TPROXY --on-ip ::1 --on-port $tproxy_port
+			ip6tables -t mangle -N merlinclash 2>/dev/null || ip6tables -t mangle -S merlinclash >/dev/null 2>&1 || return 1
+			ip6tables -t mangle -F merlinclash || return 1
+			ip6tables -t mangle -A merlinclash -m conntrack --ctstate NEW -j MARK --set-mark 0x2333 || return 1
+            ip6tables -t mangle -A merlinclash -j CONNMARK --save-mark || return 1
+			ip6tables -t mangle -A merlinclash -p tcp -m mark --mark 0x2333 -j TPROXY --on-ip ::1 --on-port $tproxy_port || return 1
+            ip6tables -t mangle -A merlinclash -p udp -m mark --mark 0x2333 -j TPROXY --on-ip ::1 --on-port $tproxy_port || return 1
             
 			#非首包有mark直接转发，无mark直连不再进行黑白名单及acl判断
-			ip6tables -t mangle -N merlinclash_divert
-			ip6tables -t mangle -F merlinclash_divert
-			ip6tables -t mangle -A merlinclash_divert -j CONNMARK --restore-mark
-			ip6tables -t mangle -A merlinclash_divert -p tcp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip ::1 --on-port $tproxy_port
-            ip6tables -t mangle -A merlinclash_divert -p udp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip ::1 --on-port $tproxy_port
-            ip6tables -t mangle -A merlinclash_divert -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-            ip6tables -t mangle -A merlinclash_divert -m conntrack --ctstate INVALID -j DROP
+			ip6tables -t mangle -N merlinclash_divert 2>/dev/null || ip6tables -t mangle -S merlinclash_divert >/dev/null 2>&1 || return 1
+			ip6tables -t mangle -F merlinclash_divert || return 1
+			ip6tables -t mangle -A merlinclash_divert -j CONNMARK --restore-mark || return 1
+			ip6tables -t mangle -A merlinclash_divert -p tcp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip ::1 --on-port $tproxy_port || return 1
+            ip6tables -t mangle -A merlinclash_divert -p udp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip ::1 --on-port $tproxy_port || return 1
+            ip6tables -t mangle -A merlinclash_divert -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || return 1
+            ip6tables -t mangle -A merlinclash_divert -m conntrack --ctstate INVALID -j DROP || return 1
 
 			#echo_date "创建【ipv6-mangle】表【merlinclash】链" >> $LOG_FILE
 			if [ "${merlinclash_ipt_proxyiot_sw}" != "1" ]; then
-				ip6tables -t mangle -A merlinclash_PREROUTING -i br1 -j RETURN
-				ip6tables -t mangle -A merlinclash_PREROUTING -i br2 -j RETURN
-				ip6tables -t mangle -A merlinclash_PREROUTING -i br5+ -j RETURN
+				ip6tables -t mangle -A merlinclash_PREROUTING -i br1 -j RETURN || return 1
+				ip6tables -t mangle -A merlinclash_PREROUTING -i br2 -j RETURN || return 1
+				ip6tables -t mangle -A merlinclash_PREROUTING -i br5+ -j RETURN || return 1
 			fi
 			#强制转发clash
-			ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxy6 dst -j merlinclash
-			ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set ipset_proxy6 dst -j merlinclash
+			ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxy6 dst -j merlinclash || return 1
+			ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set ipset_proxy6 dst -j merlinclash || return 1
 			
 			#强制绕行clash
-			ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxyarround6 dst -j RETURN
-			ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set ipset_proxyarround6 dst -j RETURN
+			ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxyarround6 dst -j RETURN || return 1
+			ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set ipset_proxyarround6 dst -j RETURN || return 1
 			#局域网&排除地址绕行
 			echo_date "局域网&排除地址绕行" >> $LOG_FILE
-			ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set direct_list6 dst -j RETURN
-			ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set direct_list6 dst -j RETURN
+			ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set direct_list6 dst -j RETURN || return 1
+			ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set direct_list6 dst -j RETURN || return 1
 			#
 			if [ "$cirswitch" == "1" ]; then	
-				ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set china_ip_route6 dst -j RETURN											
-				ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set china_ip_route6 dst -j RETURN
+				ip6tables -t mangle -A merlinclash_PREROUTING -p udp -m set --match-set china_ip_route6 dst -j RETURN || return 1
+				ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set china_ip_route6 dst -j RETURN || return 1
 			fi
 			
-			lan_bypass
-			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_divert
-			iptables -t mangle -A PREROUTING -p udp -j merlinclash_divert
-			ip6tables -t mangle -A PREROUTING -p tcp -j merlinclash_divert
-			ip6tables -t mangle -A PREROUTING -p udp -j merlinclash_divert			
-			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_PREROUTING
-			iptables -t mangle -A PREROUTING -p udp -j merlinclash_PREROUTING
-			ip6tables -t mangle -A PREROUTING -p tcp -j merlinclash_PREROUTING
-			ip6tables -t mangle -A PREROUTING -p udp -j merlinclash_PREROUTING
+			lan_bypass || return 1
+			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_divert || return 1
+			iptables -t mangle -A PREROUTING -p udp -j merlinclash_divert || return 1
+			ip6tables -t mangle -A PREROUTING -p tcp -j merlinclash_divert || return 1
+			ip6tables -t mangle -A PREROUTING -p udp -j merlinclash_divert || return 1
+			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_PREROUTING || return 1
+			iptables -t mangle -A PREROUTING -p udp -j merlinclash_PREROUTING || return 1
+			ip6tables -t mangle -A PREROUTING -p tcp -j merlinclash_PREROUTING || return 1
+			ip6tables -t mangle -A PREROUTING -p udp -j merlinclash_PREROUTING || return 1
 			
 		fi
 		
 		if [ "$dnsgoclash" == "1" ]; then
-			ip -4 rule add fwmark 0x1111         table 233
-			iptables -t nat -N merlinclash_OUTPUT
-			iptables -t nat -A merlinclash_OUTPUT -p tcp -m set --match-set direct_list dst -j RETURN
-            iptables -t nat -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN
-			iptables -t nat -A merlinclash_OUTPUT -p udp --dport 53 -j REDIRECT --to-port 53
-			iptables -t nat -I OUTPUT -j merlinclash_OUTPUT
-			iptables -t mangle -N merlinclash_OUTPUT
-			iptables -t mangle -A merlinclash_OUTPUT ! -s $wan_ipaddr -j RETURN
-			iptables -t mangle -A merlinclash_OUTPUT -p udp --dport 53 -j RETURN
-			iptables -t mangle -A merlinclash_OUTPUT -m set --match-set direct_list dst -j RETURN
-            iptables -t mangle -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN
+			mc_ensure_policy_rule -4 0x1111 || return 1
+			iptables -t nat -N merlinclash_OUTPUT 2>/dev/null || iptables -t nat -S merlinclash_OUTPUT >/dev/null 2>&1 || return 1
+			iptables -t nat -A merlinclash_OUTPUT -p tcp -m set --match-set direct_list dst -j RETURN || return 1
+            iptables -t nat -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN || return 1
+			iptables -t nat -A merlinclash_OUTPUT -p udp --dport 53 -j REDIRECT --to-port 53 || return 1
+			iptables -t nat -I OUTPUT -j merlinclash_OUTPUT || return 1
+			iptables -t mangle -N merlinclash_OUTPUT 2>/dev/null || iptables -t mangle -S merlinclash_OUTPUT >/dev/null 2>&1 || return 1
+			iptables -t mangle -A merlinclash_OUTPUT ! -s $wan_ipaddr -j RETURN || return 1
+			iptables -t mangle -A merlinclash_OUTPUT -p udp --dport 53 -j RETURN || return 1
+			iptables -t mangle -A merlinclash_OUTPUT -m set --match-set direct_list dst -j RETURN || return 1
+            iptables -t mangle -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN || return 1
 			if [ "$cirswitch" == "1" ]; then	
-				iptables -t mangle -A merlinclash_OUTPUT -m set --match-set china_ip_route dst -j RETURN
+				iptables -t mangle -A merlinclash_OUTPUT -m set --match-set china_ip_route dst -j RETURN || return 1
 			fi
-			iptables -t mangle -A merlinclash_OUTPUT -j CONNMARK --restore-mark
-			iptables -t mangle -A merlinclash_OUTPUT -p tcp -s -m mark --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j MARK --set-mark 0x1111
-			iptables -t mangle -A merlinclash_OUTPUT -p udp -s -m mark --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j MARK --set-mark 0x1111
-            iptables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-            iptables -t mangle -A merlinclash_OUTPUT  -m mark ! --mark 0x1111 -m conntrack --ctstate INVALID -j DROP
-			iptables -t mangle -A merlinclash_OUTPUT -p tcp -m conntrack --ctstate NEW -j MARK --set-mark 0x1111
-			iptables -t mangle -A merlinclash_OUTPUT -p udp -m conntrack --ctstate NEW -j MARK --set-mark 0x1111
-			iptables -t mangle -A merlinclash_OUTPUT -j CONNMARK --save-mark
+			iptables -t mangle -A merlinclash_OUTPUT -j CONNMARK --restore-mark || return 1
+			iptables -t mangle -A merlinclash_OUTPUT -p tcp -m mark --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j MARK --set-mark 0x1111 || return 1
+			iptables -t mangle -A merlinclash_OUTPUT -p udp -m mark --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j MARK --set-mark 0x1111 || return 1
+            iptables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || return 1
+            iptables -t mangle -A merlinclash_OUTPUT  -m mark ! --mark 0x1111 -m conntrack --ctstate INVALID -j DROP || return 1
+			iptables -t mangle -A merlinclash_OUTPUT -p tcp -m conntrack --ctstate NEW -j MARK --set-mark 0x1111 || return 1
+			iptables -t mangle -A merlinclash_OUTPUT -p udp -m conntrack --ctstate NEW -j MARK --set-mark 0x1111 || return 1
+			iptables -t mangle -A merlinclash_OUTPUT -j CONNMARK --save-mark || return 1
 
-			iptables -t mangle -I OUTPUT -j merlinclash_OUTPUT
+			iptables -t mangle -I OUTPUT -j merlinclash_OUTPUT || return 1
 
-			iptables -t mangle -I merlinclash_divert -p udp -s $wan_ipaddr -m mark --mark 0x1111 -m conntrack --ctstate NEW,RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port
-			iptables -t mangle -I merlinclash_divert -p tcp -s $wan_ipaddr -m mark --mark 0x1111 -m conntrack --ctstate NEW,RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port
-			iptables -t mangle -D merlinclash_divert -j CONNMARK --restore-mark
-			iptables -t mangle -I merlinclash_divert -j CONNMARK --restore-mark
+			iptables -t mangle -I merlinclash_divert -p udp -s $wan_ipaddr -m mark --mark 0x1111 -m conntrack --ctstate NEW,RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port || return 1
+			iptables -t mangle -I merlinclash_divert -p tcp -s $wan_ipaddr -m mark --mark 0x1111 -m conntrack --ctstate NEW,RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port || return 1
+			iptables -t mangle -D merlinclash_divert -j CONNMARK --restore-mark || return 1
+			iptables -t mangle -I merlinclash_divert -j CONNMARK --restore-mark || return 1
 			if [ "$ipv6_flag" == "1" ]; then
-				ip -6 rule add fwmark 0x1111         table 233
+				mc_ensure_policy_rule -6 0x1111 || return 1
 				wan_ip6addr=$(ip -6 addr show dev ppp0 | sed -n '/inet/{s!.*inet6* !!;s!/.*!!p}' | sed 's/peer.*//' | grep -v '^fe80')
-				ip6tables -t mangle -N merlinclash_OUTPUT
-				ip6tables -t mangle -A merlinclash_OUTPUT ! -s $wan_ip6addr -j RETURN
-				ip6tables -t mangle -A merlinclash_OUTPUT -p udp --dport 53 -j RETURN
-				ip6tables -t mangle -A merlinclash_OUTPUT -m set --match-set direct_list6 dst -j RETURN
-                ip6tables -t mangle -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN
+				ip6tables -t mangle -N merlinclash_OUTPUT 2>/dev/null || ip6tables -t mangle -S merlinclash_OUTPUT >/dev/null 2>&1 || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT ! -s $wan_ip6addr -j RETURN || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -p udp --dport 53 -j RETURN || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -m set --match-set direct_list6 dst -j RETURN || return 1
+                ip6tables -t mangle -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN || return 1
 				if [ "$cirswitch" == "1" ]; then
-				    ip6tables -t mangle -A merlinclash_OUTPUT -m set --match-set china_ip_route6 dst -j RETURN
+				    ip6tables -t mangle -A merlinclash_OUTPUT -m set --match-set china_ip_route6 dst -j RETURN || return 1
 			    fi
-				ip6tables -t mangle -A merlinclash_OUTPUT -j CONNMARK --restore-mark
-				ip6tables -t mangle -A merlinclash_OUTPUT -p tcp -m mark --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j MARK --set-mark 0x1111
-				ip6tables -t mangle -A merlinclash_OUTPUT -p udp -m mark --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j MARK --set-mark 0x1111
-				ip6tables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-				ip6tables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate INVALID -j DROP
-				ip6tables -t mangle -A merlinclash_OUTPUT -p tcp -m conntrack --ctstate NEW -j MARK --set-mark 0x1111
-				ip6tables -t mangle -A merlinclash_OUTPUT -p udp -m conntrack --ctstate NEW -j MARK --set-mark 0x1111
-				ip6tables -t mangle -A merlinclash_OUTPUT -j CONNMARK --save-mark
+				ip6tables -t mangle -A merlinclash_OUTPUT -j CONNMARK --restore-mark || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -p tcp -m mark --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j MARK --set-mark 0x1111 || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -p udp -m mark --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j MARK --set-mark 0x1111 || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate INVALID -j DROP || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -p tcp -m conntrack --ctstate NEW -j MARK --set-mark 0x1111 || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -p udp -m conntrack --ctstate NEW -j MARK --set-mark 0x1111 || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -j CONNMARK --save-mark || return 1
 
-				ip6tables -t mangle -I OUTPUT -j merlinclash_OUTPUT
+				ip6tables -t mangle -I OUTPUT -j merlinclash_OUTPUT || return 1
 				#取到wan口ipv6地址
-				ip6tables -t mangle -I merlinclash_divert -p udp -s $wan_ip6addr -m mark --mark 0x1111 -m conntrack --ctstate NEW,RELATED,ESTABLISHED -j TPROXY --on-ip ::1 --on-port $tproxy_port
-				ip6tables -t mangle -I merlinclash_divert -p tcp -s $wan_ip6addr -m mark --mark 0x1111 -m conntrack --ctstate NEW,RELATED,ESTABLISHED -j TPROXY --on-ip ::1 --on-port $tproxy_port
-				ip6tables -t mangle -D merlinclash_divert -j CONNMARK --restore-mark
-				ip6tables -t mangle -I merlinclash_divert -j CONNMARK --restore-mark
+				ip6tables -t mangle -I merlinclash_divert -p udp -s $wan_ip6addr -m mark --mark 0x1111 -m conntrack --ctstate NEW,RELATED,ESTABLISHED -j TPROXY --on-ip ::1 --on-port $tproxy_port || return 1
+				ip6tables -t mangle -I merlinclash_divert -p tcp -s $wan_ip6addr -m mark --mark 0x1111 -m conntrack --ctstate NEW,RELATED,ESTABLISHED -j TPROXY --on-ip ::1 --on-port $tproxy_port || return 1
+				ip6tables -t mangle -D merlinclash_divert -j CONNMARK --restore-mark || return 1
+				ip6tables -t mangle -I merlinclash_divert -j CONNMARK --restore-mark || return 1
 			fi
 		fi
 	elif [ "$tproxymode" == "tcp" ]; then
@@ -1703,181 +1707,162 @@ apply_nat_rules() {
 		fi
 
 		# 设置策略路由
-		load_tproxy
-		ip -4 route add local default dev lo table 233
-		ip -4 rule add fwmark 0x2333         table 233
+		load_tproxy || return 1
+		ip -4 route replace local default dev lo table 233 || return 1
+		mc_ensure_policy_rule -4 0x2333 || return 1
 
 		#同步路由家长电脑控制
-		iptables -t filter -S PControls | while read -r line; do iptables -t mangle $line; done
-		iptables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g'|while read -r line; do iptables -t mangle $line; done
+		iptables -t filter -S PControls | sed 's/PControls/MC_PControls/g' | while read -r line; do iptables -t mangle $line || return 1; done || return 1
+		iptables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g;s/PControls/MC_PControls/g'|while read -r line; do iptables -t mangle $line || return 1; done || return 1
 
 		#添加merlinclash_PREROUTING链
-		iptables -t mangle -N merlinclash_PREROUTING
-		iptables -t mangle -F merlinclash_PREROUTING
+		iptables -t mangle -N merlinclash_PREROUTING 2>/dev/null || iptables -t mangle -S merlinclash_PREROUTING >/dev/null 2>&1 || return 1
+		iptables -t mangle -F merlinclash_PREROUTING || return 1
 
 		#仅对首包进行判断是否走clash，对转发的链接打上mark
-		iptables -t mangle -N merlinclash
-		iptables -t mangle -F merlinclash
-		iptables -t mangle -A merlinclash -m conntrack --ctstate NEW -j MARK --set-mark 0x2333
-        iptables -t mangle -A merlinclash -j CONNMARK --save-mark
-        iptables -t mangle -A merlinclash -p tcp -m mark --mark 0x2333 -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port
+		iptables -t mangle -N merlinclash 2>/dev/null || iptables -t mangle -S merlinclash >/dev/null 2>&1 || return 1
+		iptables -t mangle -F merlinclash || return 1
+		iptables -t mangle -A merlinclash -m conntrack --ctstate NEW -j MARK --set-mark 0x2333 || return 1
+        iptables -t mangle -A merlinclash -j CONNMARK --save-mark || return 1
+        iptables -t mangle -A merlinclash -p tcp -m mark --mark 0x2333 -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port || return 1
             
 		#非首包有mark直接转发，无mark直连不再进行黑白名单及acl判断
-		iptables -t mangle -N merlinclash_divert
-		iptables -t mangle -F merlinclash_divert
-		iptables -t mangle -A merlinclash_divert -j CONNMARK --restore-mark
-        iptables -t mangle -A merlinclash_divert -p tcp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port
-        iptables -t mangle -A merlinclash_divert -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-        iptables -t mangle -A merlinclash_divert -m conntrack --ctstate INVALID -j DROP
+		iptables -t mangle -N merlinclash_divert 2>/dev/null || iptables -t mangle -S merlinclash_divert >/dev/null 2>&1 || return 1
+		iptables -t mangle -F merlinclash_divert || return 1
+		iptables -t mangle -A merlinclash_divert -j CONNMARK --restore-mark || return 1
+        iptables -t mangle -A merlinclash_divert -p tcp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port || return 1
+        iptables -t mangle -A merlinclash_divert -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || return 1
+        iptables -t mangle -A merlinclash_divert -m conntrack --ctstate INVALID -j DROP || return 1
 
 		#echo_date "创建【mangle】表【merlinclash】链" >> $LOG_FILE
 		if [ "${merlinclash_ipt_proxyiot_sw}" != "1" ]; then
-			iptables -t mangle -A merlinclash_PREROUTING -i br1 -j RETURN
-			iptables -t mangle -A merlinclash_PREROUTING -i br2 -j RETURN
-			iptables -t mangle -A merlinclash_PREROUTING -i br5+ -j RETURN
+			iptables -t mangle -A merlinclash_PREROUTING -i br1 -j RETURN || return 1
+			iptables -t mangle -A merlinclash_PREROUTING -i br2 -j RETURN || return 1
+			iptables -t mangle -A merlinclash_PREROUTING -i br5+ -j RETURN || return 1
 		fi
 		#iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set router dst -j merlinclash
 		#ip集强制代理
-		iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxy dst --syn -j merlinclash
+		iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxy dst --syn -j merlinclash || return 1
 		#ip集强制绕过
-		iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxyarround dst -j RETURN
+		iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxyarround dst -j RETURN || return 1
 		#局域网&排除地址绕行
-		iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set direct_list dst -j RETURN
+		iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set direct_list dst -j RETURN || return 1
 		#
 		if [ "$cirswitch" == "1" ]; then	
-			iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set china_ip_route dst -j RETURN
+			iptables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set china_ip_route dst -j RETURN || return 1
 		fi
 
 		if [ "$ipv6_flag" == "0" ]; then
-			echo_date "清除wanduck监听规则" >> $LOG_FILE
-			wanduck1_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/18017/=' | sort -r)
-			for wanduck1_index in $wanduck1_indexs; do
-				iptables -t nat -D PREROUTING $wanduck1_index >/dev/null 2>&1
-			done
-			wanduck2_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/18018/=' | sort -r)
-			for wanduck2_index in $wanduck2_indexs; do
-				iptables -t nat -D PREROUTING $wanduck2_index >/dev/null 2>&1
-			done
-			lan_bypass
-			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_divert
-			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_PREROUTING
+			lan_bypass || return 1
+			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_divert || return 1
+			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_PREROUTING || return 1
 			
 		fi
 		# ipv6设置策略路由
 		if [ "$ipv6_flag" == "1" ]; then
-			echo_date "清除wanduck监听规则" >> $LOG_FILE
-			wanduck1_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/18017/=' | sort -r)
-			for wanduck1_index in $wanduck1_indexs; do
-				iptables -t nat -D PREROUTING $wanduck1_index >/dev/null 2>&1
-			done
-			wanduck2_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/18018/=' | sort -r)
-			for wanduck2_index in $wanduck2_indexs; do
-				iptables -t nat -D PREROUTING $wanduck2_index >/dev/null 2>&1
-			done
 
-			ip -6 route add local default dev lo table 233
-			ip -6 rule add fwmark 0x2333         table 233
+			ip -6 route replace local default dev lo table 233 || return 1
+			mc_ensure_policy_rule -6 0x2333 || return 1
 
 			#同步路由家长电脑控制
-			ip6tables -t filter -S PControls | while read -r line; do ip6tables -t mangle $line; done
-			ip6tables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g'|while read -r line; do ip6tables -t mangle $line; done
+			ip6tables -t filter -S PControls | sed 's/PControls/MC_PControls/g' | while read -r line; do ip6tables -t mangle $line || return 1; done || return 1
+			ip6tables -t filter -S FORWARD|grep PControls|sed 's/-A FORWARD/-I PREROUTING/g;s/PControls/MC_PControls/g'|while read -r line; do ip6tables -t mangle $line || return 1; done || return 1
 
 			#添加merlinclash_PREROUTING链
-			ip6tables -t mangle -N merlinclash_PREROUTING
-			ip6tables -t mangle -F merlinclash_PREROUTING
+			ip6tables -t mangle -N merlinclash_PREROUTING 2>/dev/null || ip6tables -t mangle -S merlinclash_PREROUTING >/dev/null 2>&1 || return 1
+			ip6tables -t mangle -F merlinclash_PREROUTING || return 1
 
 			#仅对首包进行判断是否走clash，对转发的链接打上mark
-			ip6tables -t mangle -N merlinclash
-			ip6tables -t mangle -F merlinclash
-			ip6tables -t mangle -A merlinclash -m conntrack --ctstate NEW -j MARK --set-mark 0x2333
-            ip6tables -t mangle -A merlinclash -j CONNMARK --save-mark
-			ip6tables -t mangle -A merlinclash -p tcp -m mark --mark 0x2333 -j TPROXY --on-ip ::1 --on-port $tproxy_port
+			ip6tables -t mangle -N merlinclash 2>/dev/null || ip6tables -t mangle -S merlinclash >/dev/null 2>&1 || return 1
+			ip6tables -t mangle -F merlinclash || return 1
+			ip6tables -t mangle -A merlinclash -m conntrack --ctstate NEW -j MARK --set-mark 0x2333 || return 1
+            ip6tables -t mangle -A merlinclash -j CONNMARK --save-mark || return 1
+			ip6tables -t mangle -A merlinclash -p tcp -m mark --mark 0x2333 -j TPROXY --on-ip ::1 --on-port $tproxy_port || return 1
                        
 			#非首包有mark直接转发，无mark直连不再进行黑白名单及acl判断
-			ip6tables -t mangle -N merlinclash_divert
-			ip6tables -t mangle -F merlinclash_divert
-			ip6tables -t mangle -A merlinclash_divert -j CONNMARK --restore-mark
-			ip6tables -t mangle -A merlinclash_divert -p tcp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip ::1 --on-port $tproxy_port
-            ip6tables -t mangle -A merlinclash_divert -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-            ip6tables -t mangle -A merlinclash_divert -m conntrack --ctstate INVALID -j DROP
+			ip6tables -t mangle -N merlinclash_divert 2>/dev/null || ip6tables -t mangle -S merlinclash_divert >/dev/null 2>&1 || return 1
+			ip6tables -t mangle -F merlinclash_divert || return 1
+			ip6tables -t mangle -A merlinclash_divert -j CONNMARK --restore-mark || return 1
+			ip6tables -t mangle -A merlinclash_divert -p tcp -m mark --mark 0x2333 -m conntrack --ctstate RELATED,ESTABLISHED -j TPROXY --on-ip ::1 --on-port $tproxy_port || return 1
+            ip6tables -t mangle -A merlinclash_divert -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || return 1
+            ip6tables -t mangle -A merlinclash_divert -m conntrack --ctstate INVALID -j DROP || return 1
 
 			#echo_date "创建【ipv6-mangle】表【merlinclash】链" >> $LOG_FILE
 			if [ "${merlinclash_ipt_proxyiot_sw}" != "1" ]; then
-				ip6tables -t mangle -A merlinclash_PREROUTING -i br1 -j RETURN
-				ip6tables -t mangle -A merlinclash_PREROUTING -i br2 -j RETURN
-				ip6tables -t mangle -A merlinclash_PREROUTING -i br5+ -j RETURN
+				ip6tables -t mangle -A merlinclash_PREROUTING -i br1 -j RETURN || return 1
+				ip6tables -t mangle -A merlinclash_PREROUTING -i br2 -j RETURN || return 1
+				ip6tables -t mangle -A merlinclash_PREROUTING -i br5+ -j RETURN || return 1
 			fi
 			#强制转发clash
-			ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxy6 dst -j merlinclash
+			ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxy6 dst -j merlinclash || return 1
 			#强制绕行clash
-			ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxyarround6 dst -j RETURN
+			ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set ipset_proxyarround6 dst -j RETURN || return 1
 			#局域网&排除地址绕行
-			ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set direct_list6 dst -j RETURN
+			ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set direct_list6 dst -j RETURN || return 1
 			#
 			if [ "$cirswitch" == "1" ]; then	
-				ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set china_ip_route6 dst -j RETURN
+				ip6tables -t mangle -A merlinclash_PREROUTING -p tcp -m set --match-set china_ip_route6 dst -j RETURN || return 1
 			fi
 
-			lan_bypass
-			
-			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_divert
-			ip6tables -t mangle -A PREROUTING -p tcp -j merlinclash_divert
-			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_PREROUTING
-			ip6tables -t mangle -A PREROUTING -p tcp -j merlinclash_PREROUTING
+			lan_bypass || return 1
+			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_divert || return 1
+			ip6tables -t mangle -A PREROUTING -p tcp -j merlinclash_divert || return 1
+			iptables -t mangle -A PREROUTING -p tcp -j merlinclash_PREROUTING || return 1
+			ip6tables -t mangle -A PREROUTING -p tcp -j merlinclash_PREROUTING || return 1
 		
 		fi
 
 		
 		if [ "$dnsgoclash" == "1" ]; then
-			ip -4 rule add fwmark 0x1111         table 233
-			iptables -t nat -N merlinclash_OUTPUT
-			iptables -t nat -A merlinclash_OUTPUT -p tcp -m set --match-set direct_list dst -j RETURN
-            iptables -t nat -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN
-			iptables -t nat -A merlinclash_OUTPUT -p udp --dport 53 -j REDIRECT --to-port 53
-			iptables -t nat -I OUTPUT -j merlinclash_OUTPUT
-			iptables -t mangle -N merlinclash_OUTPUT
-			iptables -t mangle -A merlinclash_OUTPUT ! -s $wan_ipaddr -j RETURN
-			iptables -t mangle -A merlinclash_OUTPUT -p udp --dport 53 -j RETURN
-			iptables -t mangle -A merlinclash_OUTPUT -m set --match-set direct_list dst -j RETURN
-            iptables -t mangle -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN
+			mc_ensure_policy_rule -4 0x1111 || return 1
+			iptables -t nat -N merlinclash_OUTPUT 2>/dev/null || iptables -t nat -S merlinclash_OUTPUT >/dev/null 2>&1 || return 1
+			iptables -t nat -A merlinclash_OUTPUT -p tcp -m set --match-set direct_list dst -j RETURN || return 1
+            iptables -t nat -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN || return 1
+			iptables -t nat -A merlinclash_OUTPUT -p udp --dport 53 -j REDIRECT --to-port 53 || return 1
+			iptables -t nat -I OUTPUT -j merlinclash_OUTPUT || return 1
+			iptables -t mangle -N merlinclash_OUTPUT 2>/dev/null || iptables -t mangle -S merlinclash_OUTPUT >/dev/null 2>&1 || return 1
+			iptables -t mangle -A merlinclash_OUTPUT ! -s $wan_ipaddr -j RETURN || return 1
+			iptables -t mangle -A merlinclash_OUTPUT -p udp --dport 53 -j RETURN || return 1
+			iptables -t mangle -A merlinclash_OUTPUT -m set --match-set direct_list dst -j RETURN || return 1
+            iptables -t mangle -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN || return 1
 			if [ "$cirswitch" == "1" ]; then	
-				iptables -t mangle -A merlinclash_OUTPUT -m set --match-set china_ip_route dst -j RETURN
+				iptables -t mangle -A merlinclash_OUTPUT -m set --match-set china_ip_route dst -j RETURN || return 1
 			fi
-			iptables -t mangle -A merlinclash_OUTPUT -j CONNMARK --restore-mark
-			iptables -t mangle -A merlinclash_OUTPUT -p tcp -m mark --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j MARK --set-mark 0x1111
-            iptables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-            iptables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate INVALID -j DROP
-			iptables -t mangle -A merlinclash_OUTPUT -p tcp -m conntrack --ctstate NEW -j MARK --set-mark 0x1111
-			iptables -t mangle -A merlinclash_OUTPUT -j CONNMARK --save-mark
+			iptables -t mangle -A merlinclash_OUTPUT -j CONNMARK --restore-mark || return 1
+			iptables -t mangle -A merlinclash_OUTPUT -p tcp -m mark --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j MARK --set-mark 0x1111 || return 1
+            iptables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || return 1
+            iptables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate INVALID -j DROP || return 1
+			iptables -t mangle -A merlinclash_OUTPUT -p tcp -m conntrack --ctstate NEW -j MARK --set-mark 0x1111 || return 1
+			iptables -t mangle -A merlinclash_OUTPUT -j CONNMARK --save-mark || return 1
 
-			iptables -t mangle -I OUTPUT -j merlinclash_OUTPUT
+			iptables -t mangle -I OUTPUT -j merlinclash_OUTPUT || return 1
 
-			iptables -t mangle -I merlinclash_divert -p tcp -s $wan_ipaddr -m mark --mark 0x1111 -m conntrack --ctstate NEW,RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port
-			iptables -t mangle -D merlinclash_divert -j CONNMARK --restore-mark
-			iptables -t mangle -I merlinclash_divert -j CONNMARK --restore-mark
+			iptables -t mangle -I merlinclash_divert -p tcp -s $wan_ipaddr -m mark --mark 0x1111 -m conntrack --ctstate NEW,RELATED,ESTABLISHED -j TPROXY --on-ip 127.0.0.1 --on-port $tproxy_port || return 1
+			iptables -t mangle -D merlinclash_divert -j CONNMARK --restore-mark || return 1
+			iptables -t mangle -I merlinclash_divert -j CONNMARK --restore-mark || return 1
 			if [ "$ipv6_flag" == "1" ]; then
-				ip -6 rule add fwmark 0x1111         table 233
+				mc_ensure_policy_rule -6 0x1111 || return 1
 				wan_ip6addr=$(ip -6 addr show dev ppp0 | sed -n '/inet/{s!.*inet6* !!;s!/.*!!p}' | sed 's/peer.*//' | grep -v '^fe80')
-				ip6tables -t mangle -N merlinclash_OUTPUT
-				ip6tables -t mangle -A merlinclash_OUTPUT ! -s $wan_ip6addr -j RETURN
-				ip6tables -t mangle -A merlinclash_OUTPUT -p udp --dport 53 -j RETURN
-				ip6tables -t mangle -A merlinclash_OUTPUT -m set --match-set direct_list6 dst -j RETURN
-                ip6tables -t mangle -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN
+				ip6tables -t mangle -N merlinclash_OUTPUT 2>/dev/null || ip6tables -t mangle -S merlinclash_OUTPUT >/dev/null 2>&1 || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT ! -s $wan_ip6addr -j RETURN || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -p udp --dport 53 -j RETURN || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -m set --match-set direct_list6 dst -j RETURN || return 1
+                ip6tables -t mangle -A merlinclash_OUTPUT -m mark --mark $mcrm -j RETURN || return 1
 				if [ "$cirswitch" == "1" ]; then
-				    ip6tables -t mangle -A merlinclash_OUTPUT -m set --match-set china_ip_route6 dst -j RETURN
+				    ip6tables -t mangle -A merlinclash_OUTPUT -m set --match-set china_ip_route6 dst -j RETURN || return 1
 			    fi
-				ip6tables -t mangle -A merlinclash_OUTPUT -j CONNMARK --restore-mark
-				ip6tables -t mangle -A merlinclash_OUTPUT -p tcp -m mark --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j MARK --set-mark 0x1111
-				ip6tables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-				ip6tables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate INVALID -j DROP
-				ip6tables -t mangle -A merlinclash_OUTPUT -p tcp -m conntrack --ctstate NEW -j MARK --set-mark 0x1111
-				ip6tables -t mangle -A merlinclash_OUTPUT -j CONNMARK --save-mark
+				ip6tables -t mangle -A merlinclash_OUTPUT -j CONNMARK --restore-mark || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -p tcp -m mark --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j MARK --set-mark 0x1111 || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -m mark ! --mark 0x1111 -m conntrack --ctstate INVALID -j DROP || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -p tcp -m conntrack --ctstate NEW -j MARK --set-mark 0x1111 || return 1
+				ip6tables -t mangle -A merlinclash_OUTPUT -j CONNMARK --save-mark || return 1
 
-				ip6tables -t mangle -I OUTPUT -j merlinclash_OUTPUT
+				ip6tables -t mangle -I OUTPUT -j merlinclash_OUTPUT || return 1
 				#取到wan口ipv6地址
-				ip6tables -t mangle -I merlinclash_divert -p tcp -s $wan_ip6addr -m mark --mark 0x1111 -m conntrack --ctstate NEW,RELATED,ESTABLISHED -j TPROXY --on-ip ::1 --on-port $tproxy_port
-				ip6tables -t mangle -D merlinclash_divert -j CONNMARK --restore-mark
-				ip6tables -t mangle -I merlinclash_divert -j CONNMARK --restore-mark
+				ip6tables -t mangle -I merlinclash_divert -p tcp -s $wan_ip6addr -m mark --mark 0x1111 -m conntrack --ctstate NEW,RELATED,ESTABLISHED -j TPROXY --on-ip ::1 --on-port $tproxy_port || return 1
+				ip6tables -t mangle -D merlinclash_divert -j CONNMARK --restore-mark || return 1
+				ip6tables -t mangle -I merlinclash_divert -j CONNMARK --restore-mark || return 1
 			fi
 		fi
 	fi
@@ -1886,23 +1871,23 @@ apply_nat_rules() {
 	QOSO=$(iptables -t mangle -S | grep -o QOSO | wc -l)
 	RRULE=$(iptables -t mangle -S | grep "A QOSO" | head -n1 | grep RETURN)
 	if [ "$QOSO" -gt "1" ] && [ -z "$RRULE" ]; then
-		iptables -t mangle -I QOSO0 -m mark --mark "$ip_prefix_hex" -j RETURN
+		iptables -t mangle -I QOSO0 -m mark --mark "$ip_prefix_hex" -g merlinclash_RETURN || return 1
 	fi
 	#路由IPV6开启，但是不开启tproxy代理，仅开启ipv6劫持解析，需要内核4.1以上
 	if [ "${LINUX_VER}" -ge "41" ] && [ "$ipv6switch" == "0" ] && [ $(ipv6_mode) == "true" ]; then
-		load_tproxy
+		load_tproxy || return 1
 		echo_date "检测到路由IPv6开启，但未开启Tproxy代理，仅开启IPv6劫持解析" >> $LOG_FILE
-		ip -6 route add local default dev lo table 233
-		ip -6 rule add fwmark 0x2333         table 233
+		ip -6 route replace local default dev lo table 233 || return 1
+		mc_ensure_policy_rule -6 0x2333 || return 1
 	fi
 	if [ "${LINUX_VER}" -lt "41" ] && [ $(ipv6_mode) == "true" ]; then
-		load_tproxy
+		load_tproxy || return 1
 		echo_date "检测到路由IPv6开启，但未开启Tproxy代理，仅开启IPv6劫持解析" >> $LOG_FILE
-		ip -6 route add local default dev lo table 233
-		ip -6 rule add fwmark 0x2333         table 233
+		ip -6 route replace local default dev lo table 233 || return 1
+		mc_ensure_policy_rule -6 0x2333 || return 1
 	fi
 	if [ "$dnsplan" == "fi" ]; then
-		ip6tables -t mangle -I PREROUTING -p udp --dport 53 -m set --match-set lan_mac_blacklist src -j DROP #阻断黑名单设备ipv6dns查询
+		if [ "$mnm" != "2" ]; then ip6tables -t mangle -I PREROUTING -p udp --dport 53 -m set --match-set lan_mac_blacklist src -j DROP || return 1; fi #阻断黑名单设备ipv6dns查询
 	fi
 	echo_date "iptable规则创建完成" >> $LOG_FILE
 }
@@ -1912,8 +1897,8 @@ write_update_yaml_cron(){
     yaml_dlinks_file=/jffs/softcenter/merlinclash/yaml_bak/${yamlname}.dlinks
 	
 	if [ -n "$yamlname" ] && echo "$yamlname" | grep -q '^AP_' && [ -f "${yaml_dlinks_file}" ];then
-		sed -i '/autoupdate/d' /var/spool/cron/crontabs/* >/dev/null 2>&1
-		sed -i '/autologdel/d' /var/spool/cron/crontabs/* >/dev/null 2>&1
+		cru d autoupdate
+		cru d autologdel
 
 		if [ "$mcenable" == "1" ] && [ "${clash_process_started}" = "1" ]; then
 			update_time=$(awk -F',' '{print $1; exit}' "${yaml_dlinks_file}")
@@ -1950,8 +1935,8 @@ write_setmark_cron_job(){
 		echo_date "Linux内核版本大于4.19或者启用了jffs2usb，使用内核内置代理组状态保存服务" > /tmp/upload/merlinclash_node_mark.log
 		echo_date "------ 未使用定时脚本，本处无记录日志 -------" >> /tmp/upload/merlinclash_node_mark.log
 	else
-		sed -i '/autosermark/d' /var/spool/cron/crontabs/* >/dev/null 2>&1
-		sed -i '/autologdel/d' /var/spool/cron/crontabs/* >/dev/null 2>&1
+		cru d autosermark
+		cru d autologdel
 		if [ "$mcenable" == "1" ] && [ "${clash_process_started}" = "1" ]; then
 			echo_date "开启Clash代理组状态保存服务，每分钟自动保存代理组设置" >> $LOG_FILE
 			echo_date "开启Clash代理组状态保存服务，每分钟自动保存代理组设置" > /tmp/upload/merlinclash_node_mark.log
@@ -1965,312 +1950,158 @@ write_setmark_cron_job(){
 }
 
 write_clash_restart_cron_job(){
-	mscrm=${merlinclash_select_clash_restart_minute}
-	mscrh=${merlinclash_select_clash_restart_hour}
-	mscrw=${merlinclash_select_clash_restart_week}
-	mscrd=${merlinclash_select_clash_restart_day}
-	mscrm_2=${merlinclash_select_clash_restart_minute_2}
-	remove_clash_restart_regularly(){
-		if [ -n "$(cru l|grep clash_restart)" ]; then		
-			sed -i '/clash_restart/d' /var/spool/cron/crontabs/* >/dev/null 2>&1
-		fi
-	}
-	start_clash_restart_regularly_day(){
-		remove_clash_restart_regularly
-		cru a clash_restart ${mscrm} ${mscrh}" * * * /bin/sh /jffs/softcenter/scripts/clash_restart_update.sh"
-		echo_date "Clash将于每日的${mscrh}时${mscrm}分重启" >> $LOG_FILE
-	}
-	start_clash_restart_regularly_week(){
-		remove_clash_restart_regularly
-		cru a clash_restart ${mscrm} ${mscrh}" * * "${mscrw}" /bin/sh /jffs/softcenter/scripts/clash_restart_update.sh"
-		echo_date "Clash将于每周${mscrw}的${mscrh}时${mscrm}分重启" >> $LOG_FILE
-	}
-	start_clash_restart_regularly_month(){
-		remove_clash_restart_regularly
-		cru a clash_restart ${mscrm} ${mscrh} ${mscrd}" * * /bin/sh /jffs/softcenter/scripts/clash_restart_update.sh"
-		echo_date "Clash将于每月${mscrd}号的${mscrh}时${mscrm}分重启" >> $LOG_FILE
-	}
-
-	start_clash_restart_regularly_mhour(){
-		remove_clash_restart_regularly
-		if [ "$mscrm_2" == "2" ] || [ "$mscrm_2" == "5" ] || [ "$mscrm_2" == "10" ] || [ "$mscrm_2" == "15" ] || [ "$mscrm_2" == "20" ] || [ "$mscrm_2" == "25" ] || [ "$mscrm_2" == "30" ]; then
-			cru a clash_restart "*/"${mscrm_2}" * * * * /bin/sh /jffs/softcenter/scripts/clash_restart_update.sh"
-			echo_date "Clash将每隔${mscrm_2}分钟重启" >> $LOG_FILE
-		fi
-		if [ "$mscrm_2" == "1" ] || [ "$mscrm_2" == "3" ] || [ "$mscrm_2" == "6" ] || [ "$mscrm_2" == "12" ]; then
-			cru a clash_restart "0 */"${mscrm_2} "* * * /bin/sh /jffs/softcenter/scripts/clash_restart_update.sh"
-			echo_date "Clash将每隔${mscrm_2}小时重启" >> $LOG_FILE
-		fi
-	}
-	mscr=${merlinclash_select_clash_restart}
-	case $mscr in
-	1)
-		echo_date "定时重启处于关闭状态" >> $LOG_FILE
-		remove_clash_restart_regularly
-		;;
-	2)
-		start_clash_restart_regularly_day
-		;;
-	3)
-		start_clash_restart_regularly_week
-		;;
-	4)
-		start_clash_restart_regularly_month
-		;;
-	5)
-		start_clash_restart_regularly_mhour
-		;;
-	*)
-		echo_date "定时重启处于关闭状态" >> $LOG_FILE
-		remove_clash_restart_regularly
-		;;
-	esac
+    # UI edits and controller restarts use one validated cron builder.
+    sh /jffs/softcenter/scripts/clash_restart_regularly.sh --quiet
 }
 
 ### 关闭各种服务
-kill_process() {
-	clash_process=$(pidof clash)
-	if [ -n "$clash_process" ]; then
-		echo_date "关闭Clash进程.."
-		killall clash_dog.sh >/dev/null 2>&1
-		killall clash >/dev/null 2>&1
-		kill -9 "$clash_process" >/dev/null 2>&1
-	fi
+kill_process(){
+    local p n=0
+    mc_retire_supervisors
+    for p in $(mc_core_pids); do kill "$p" 2>/dev/null || true; done
+    while [ -n "$(mc_core_pids)" ] && [ "$n" -lt 20 ]; do sleep 1; n=$((n+1)); done
+    for p in $(mc_core_pids); do kill -9 "$p" 2>/dev/null || true; done
+    n=0
+    while [ -n "$(mc_core_pids)" ] && [ "$n" -lt 20 ]; do sleep 0.25; n=$((n+1)); done
+    [ -z "$(mc_core_pids)" ] || return 1
+    rm -f /tmp/clash.pid
 }
 
-kill_cron_job() {
-	if [ -n "$(cru l | grep autosermark)" ]; then
-		echo_date 关闭代理组状态保存服务... >> $LOG_FILE
-		sed -i '/autosermark/d' /var/spool/cron/crontabs/* >/dev/null 2>&1
-	fi
-	if [ -n "$(cru l | grep autologdel)" ]; then
-		echo_date 关闭日志监测服务... >> $LOG_FILE
-		sed -i '/autologdel/d' /var/spool/cron/crontabs/* >/dev/null 2>&1
-	fi
-	if [ -n "$(cru l|grep autoupdate)" ]; then
-		echo_date 关闭定时订阅任务... >> $LOG_FILE	
-		sed -i '/autoupdate/d' /var/spool/cron/crontabs/* >/dev/null 2>&1
-	fi
-	if [ -n "$(cru l|grep clash_restart)" ]; then
-		echo_date 关闭定时重启任务... >> $LOG_FILE	
-		sed -i '/clash_restart/d' /var/spool/cron/crontabs/* >/dev/null 2>&1
-	fi
+kill_cron_job(){
+    cru d autosermark
+    cru d autologdel
+    cru d autoupdate
+    cru d clash_restart
 }
 
 flush_nat() {
-	echo_date 清除iptables规则... >> $LOG_FILE
-	# flush rules and set if any
-	iptables -t nat -D PREROUTING -i br1 -j RETURN >/dev/null 2>&1
-	iptables -t nat -D PREROUTING -i br2 -j RETURN >/dev/null 2>&1
-	iptables -t nat -D PREROUTING -i br5+ -j RETURN >/dev/null 2>&1
-	iptables -t mangle -D merlinclash_PREROUTING -i br1 -j RETURN >/dev/null 2>&1
-	iptables -t mangle -D merlinclash_PREROUTING -i br2 -j RETURN >/dev/null 2>&1
-	iptables -t mangle -D merlinclash_PREROUTING -i br5+ -j RETURN >/dev/null 2>&1
-	ip6tables -t mangle -D merlinclash_PREROUTING -i br1 -j RETURN >/dev/null 2>&1
-	ip6tables -t mangle -D merlinclash_PREROUTING -i br2 -j RETURN >/dev/null 2>&1
-	ip6tables -t mangle -D merlinclash_PREROUTING -i br5+ -j RETURN >/dev/null 2>&1
-	iptables -t nat -D PREROUTING -i br1 -j RETURN >/dev/null 2>&1
-	iptables -t nat -D PREROUTING -i br2 -j RETURN >/dev/null 2>&1
-	iptables -t nat -D PREROUTING -i br5+ -j RETURN >/dev/null 2>&1
-	iptables -t mangle -D PREROUTING -p tcp -j merlinclash_PREROUTING >/dev/null 2>&1
-	iptables -t mangle -D PREROUTING -p udp -j merlinclash_PREROUTING >/dev/null 2>&1
-	iptables -t mangle -D PREROUTING -p tcp -j merlinclash_divert >/dev/null 2>&1
-	iptables -t mangle -D PREROUTING -p udp -j merlinclash_divert >/dev/null 2>&1
-	iptables -t mangle -D PREROUTING -p udp --dport 53 -j RETURN >/dev/null 2>&1
-	ip6tables -t mangle -D PREROUTING -p udp --dport 53 -j RETURN >/dev/null 2>&1
-
-	dns_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n "/udp dpt:53/=" | sort -r)
-	for dns_index in $dns_indexs; do
-		iptables -t nat -D PREROUTING $dns_index >/dev/null 2>&1
-	done
-
-	nat_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/clash/=' | sort -r)
-	for nat_index in $nat_indexs; do
-		iptables -t nat -D PREROUTING $nat_index >/dev/null 2>&1
-	done
-	cir_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/china_ip_route/=' | sort -r)
-	for cir_index in $cir_indexs; do
-		iptables -t nat -D PREROUTING $cir_index >/dev/null 2>&1
-	done
-	cir_indexs2=$(iptables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n '/china_ip_route/=' | sort -r)
-	for cir_indexs in $cir_indexs2; do
-		iptables -t mangle -D merlinclash_PREROUTING $cir_indexs >/dev/null 2>&1
-	done
-	cir_indexs6=$(ip6tables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n '/china_ip_route6/=' | sort -r)
-	for cir_indexs in $cir_indexs6; do
-		ip6tables -t mangle -D merlinclash_PREROUTING $cir_indexs >/dev/null 2>&1
-	done
-	dir_indexs=$(iptables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n '/direct_list/=' | sort -r)
-	for dir_index in $dir_indexs; do
-		iptables -t mangle -D merlinclash_PREROUTING $dir_index >/dev/null 2>&1
-	done
-	dir_indexs6=$(ip6tables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n '/direct_list6/=' | sort -r)
-	for dir_indexs in $dir_indexs6; do
-		ip6tables -t mangle -D merlinclash_PREROUTING $dir_indexs >/dev/null 2>&1
-	done
-	noipb_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/macblacklist_dns/=' | sort -r)
-	for noipb_index in $noipb_indexs; do
-		iptables -t nat -D PREROUTING $noipb_index >/dev/null 2>&1
-	done
-	mnoipb_indexs=$(iptables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n '/macblacklist_dns/=' | sort -r)
-	for mnoipb_index in $mnoipb_indexs; do
-		iptables -t mangle -D merlinclash_PREROUTING $mnoipb_index >/dev/null 2>&1
-	done
-	mnoipb_indexs6=$(ip6tables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n '/macblacklist_dns/=' | sort -r)
-	for mnoipb_indexs in $mnoipb_indexs6; do
-		ip6tables -t mangle -D merlinclash_PREROUTING $mnoipb_indexs >/dev/null 2>&1
-	done
-	macwhite_indexs=$(iptables -nvL merlinclash_PREROUTING -t nat | sed 1,2d | sed -n '/macwhitelist_dns/=' | sort -r)
-	for macwhite_index in $macwhite_indexs; do
-		iptables -t nat -D merlinclash_PREROUTING $macwhite_index >/dev/null 2>&1
-	done
-	ipb_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/ipblacklist_dns/=' | sort -r)
-	for ipb_index in $ipb_indexs; do
-		iptables -t nat -D PREROUTING $ipb_index >/dev/null 2>&1
-	done
-	ipw_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/ipwhitelist_dns/=' | sort -r)
-	for ipw_index in $ipw_indexs; do
-		iptables -t nat -D PREROUTING $ipw_index >/dev/null 2>&1
-	done
-	mangle_indexs=$(iptables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n '/clash/=' | sort -r)
-    for mangle_index in $mangle_indexs; do
-        iptables -t mangle -D merlinclash_PREROUTING $mangle_index >/dev/null 2>&1
+    echo_date 清除iptables规则... >> "$LOG_FILE"
+    # Parse owned targets/ipsets rather than matching display text such as MAC.
+    # Numbers come from the complete chain and are deleted in numeric reverse
+    # order, so positions above nine and interleaved user rules remain correct.
+    mc_flush_external_chain() {
+        local family="$1" table="$2" chain="$3" number
+        "$family" -t "$table" -S "$chain" 2>/dev/null | awk -v table="$table" '
+            function splitrule(line, args, i,c,value,quote,escaped,n,present,sq) {
+                sq=sprintf("%c",39); value=""; quote=""; escaped=0; n=0; present=0
+                for(i=1;i<=length(line);i++) {
+                    c=substr(line,i,1)
+                    if(escaped) {value=value c; escaped=0; present=1; continue}
+                    if(c=="\\" && quote!=sq) {escaped=1; present=1; continue}
+                    if(quote!="") {if(c==quote) quote=""; else value=value c; present=1; continue}
+                    if(c=="\"" || c==sq) {quote=c; present=1; continue}
+                    if(c ~ /[[:space:]]/) {if(present) args[++n]=value; value=""; present=0; continue}
+                    value=value c; present=1
+                }
+                if(present) args[++n]=value
+                return n
+            }
+            $1=="-A" {
+                number++; owned=0; n=splitrule($0,a)
+                for(key in fields) delete fields[key]
+                for(i=3;i<n;i+=2) fields[a[i]]=a[i+1]
+                if(table=="nat" && a[2]=="PREROUTING" && n==8 && fields["-i"]=="br0" && fields["-d"]=="198.19.0.0/16" && fields["-j"]=="ACCEPT") owned=1
+                if(table=="filter" && a[2]=="FORWARD") {
+                    if(n==14 && fields["-i"]=="br0" && fields["-o"]=="mcquic" && fields["-d"]=="198.19.0.0/16" && fields["-m"]=="mark" && fields["--mark"]=="0x234/0xffff" && fields["-j"]=="ACCEPT") owned=1
+                    if(n==12 && fields["-i"]=="mcquic" && fields["-o"]=="br0" && fields["-s"]=="198.19.0.0/16" && fields["-d"] ~ /^[0-9.]+\/[0-9]+$/ && fields["-j"]=="ACCEPT") owned=1
+                    if(n==12 && fields["-i"]=="br0" && fields["-o"] ~ /^[A-Za-z0-9_.:-]+$/ && fields["-d"]=="198.19.0.0/16" && fields["-j"]=="REJECT" && fields["--reject-with"]=="icmp-port-unreachable") owned=1
+                }
+                for(i=3;i<n;i++) {
+                    if((a[i]=="-j" || a[i]=="-g") && a[i+1] ~ /^(merlinclash(_[A-Za-z0-9_]+)?|MC_PControls)$/) owned=1
+                    if(a[i]=="--match-set" && a[i+1] ~ /^(macblacklist_dns|macwhitelist_dns|ipblacklist_dns|ipwhitelist_dns|lan_mac_blacklist)$/) owned=1
+                }
+                if(owned) print number
+            }
+        ' | sort -rn | while IFS= read -r number; do
+            "$family" -t "$table" -D "$chain" "$number" >/dev/null 2>&1 || return 1
+        done
+    }
+    # The initial live snapshot proves these two exact legacy DNS53 rules came
+    # from this plugin. Retire them once; future generic unmarked rules belong
+    # to the user. New global DNS/RETURN rules enter owned payload chains.
+    if [ "$(dbus get merlinclash_firewall_ownership_v1)" != 1 ]; then
+        for protocol in udp tcp; do
+            while iptables -t nat -C PREROUTING -p "$protocol" --dport 53 -j REDIRECT --to-ports 53 2>/dev/null; do
+                iptables -t nat -D PREROUTING -p "$protocol" --dport 53 -j REDIRECT --to-ports 53 >/dev/null 2>&1 || return 1
+            done
+        done
+        dbus set merlinclash_firewall_ownership_v1=1 || return 1
+    fi
+    local family table chain
+    for family in iptables ip6tables; do
+        for table in nat mangle filter; do
+            for chain in PREROUTING OUTPUT QOSO0 FORWARD; do
+                mc_flush_external_chain "$family" "$table" "$chain" || return 1
+            done
+            # Flush every owned chain before deleting any, removing mutual
+            # references without touching shared built-in chains.
+            for chain in merlinclash merlinclash_NOR merlinclash_CHN merlinclash_EXT merlinclash_divert merlinclash_PREROUTING merlinclash_OUTPUT merlinclash_DNS53 merlinclash_RETURN merlinclash_ACCEPT merlinclash_ROUTER_DNS MC_PControls; do
+                "$family" -t "$table" -F "$chain" >/dev/null 2>&1 || :
+            done
+            for chain in merlinclash merlinclash_NOR merlinclash_CHN merlinclash_EXT merlinclash_divert merlinclash_PREROUTING merlinclash_OUTPUT merlinclash_DNS53 merlinclash_RETURN merlinclash_ACCEPT merlinclash_ROUTER_DNS MC_PControls; do
+                "$family" -t "$table" -X "$chain" >/dev/null 2>&1 || :
+            done
+        done
     done
-	mangle6_indexs=$(ip6tables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n '/clash/=' | sort -r)
-    for mangle6_index in $mangle6_indexs; do
-        ip6tables -t mangle -D merlinclash_PREROUTING $mangle6_index >/dev/null 2>&1
-    done
-	mangle4_indexs=$(iptables -nvL PREROUTING -t mangle | sed 1,2d | sed -n '/clash/=' | sort -r)
-    for mangle4_index in $mangle4_indexs; do
-        iptables -t mangle -D PREROUTING $mangle4_index >/dev/null 2>&1
-    done
-	mangle2_indexs=$(ip6tables -nvL PREROUTING -t mangle | sed 1,2d | sed -n '/clash/=' | sort -r)
-    for mangle2_index in $mangle2_indexs; do
-        ip6tables -t mangle -D PREROUTING $mangle2_index >/dev/null 2>&1
-    done
-
-	lwl_indexs=$(iptables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n "/lan_mac_whitelist/=" | sort -r)
-    for lwl_index in $lwl_indexs; do
-        iptables -t mangle -D merlinclash_PREROUTING $lwl_index >/dev/null 2>&1
-    done
-	lwl_indexs=$(iptables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n "/lan_ip_whitelist/=" | sort -r)
-    for lwl_index in $lwl_indexs; do
-        iptables -t mangle -D merlinclash_PREROUTING $lwl_index >/dev/null 2>&1
-    done
-
-	lwln_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n "/lan_mac_whitelist/=" | sort -r)
-    for lwln_index in $lwln_indexs; do
-        iptables -t nat -D PREROUTING $lwln_index >/dev/null 2>&1
-    done
-	lwln_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n "/lan_ip_whitelist/=" | sort -r)
-    for lwln_index in $lwln_indexs; do
-        iptables -t nat -D PREROUTING $lwln_index >/dev/null 2>&1
-    done
-
-	lbl_indexs=$(iptables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n "/lan_mac_blacklist/=" | sort -r)
-    for lbl_index in $lbl_indexs; do
-        iptables -t mangle -D merlinclash_PREROUTING $lbl_index >/dev/null 2>&1
-    done
-	lbl_indexs=$(iptables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n "/lan_ip_blacklist/=" | sort -r)
-    for lbl_index in $lbl_indexs; do
-        iptables -t mangle -D merlinclash_PREROUTING $lbl_index >/dev/null 2>&1
-    done
-
-	lbl_indexs6=$(ip6tables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n "/lan_mac_blacklist/=" | sort -r)
-    for lbl_indexs in $lbl_indexs6; do
-        ip6tables -t mangle -D merlinclash_PREROUTING $lbl_indexs >/dev/null 2>&1
-    done
-	lbl_indexs6=$(ip6tables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n "/lan_ip_blacklist/=" | sort -r)
-    for lbl_indexs in $lbl_indexs6; do
-        ip6tables -t mangle -D merlinclash_PREROUTING $lbl_indexs >/dev/null 2>&1
-    done
-
-	mac_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/MAC/=' | sort -r)
-    for mac_index in $mac_indexs; do
-        iptables -t nat -D PREROUTING $mac_index >/dev/null 2>&1
-    done
-	mac4_indexs=$(iptables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n '/MAC/=' | sort -r)
-    for mac4_index in $mac4_indexs; do
-        iptables -t mangle -D merlinclash_PREROUTING $mac4_index >/dev/null 2>&1
-    done
-	mac6_indexs=$(ip6tables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n '/MAC/=' | sort -r)
-    for mac6_index in $mac6_indexs; do
-        ip6tables -t mangle -D merlinclash_PREROUTING $mac6_index >/dev/null 2>&1
-    done
-	proxyarround_indexs=$(iptables -nvL PREROUTING -t nat | sed 1,2d | sed -n '/ipset_proxyarround/=' | sort -r)
-    for proxyarround_index in $proxyarround_indexs; do
-        iptables -t nat -D PREROUTING $proxyarround_index >/dev/null 2>&1
-    done
-	proxyarround4_indexs=$(iptables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n '/ipset_proxyarround/=' | sort -r)
-    for proxyarround4_index in $proxyarround4_indexs; do
-        iptables -t mangle -D merlinclash_PREROUTING $proxyarround4_index >/dev/null 2>&1
-    done
-	proxyarround6_indexs=$(ip6tables -nvL merlinclash_PREROUTING -t mangle | sed 1,2d | sed -n '/ipset_proxyarround6/=' | sort -r)
-    for proxyarround6_index in $proxyarround6_indexs; do
-        ip6tables -t mangle -D merlinclash_PREROUTING $proxyarround6_index >/dev/null 2>&1
-    done
-    iptables -t nat -D PREROUTING -p tcp -j RETURN >/dev/null 2>&1
-	iptables -t nat -D PREROUTING -p tcp -j ACCEPT >/dev/null 2>&1
-	iptables -t mangle -D PREROUTING -p udp -j ACCEPT >/dev/null 2>&1
-	iptables -t mangle -D PREROUTING -p tcp -j ACCEPT >/dev/null 2>&1
-	iptables -t mangle -D QOSO0 -m mark --mark "$ip_prefix_hex" -j RETURN >/dev/null 2>&1
-
-	#清空OUTPUT链
-	iptables -t nat -F OUTPUT >/dev/null 2>&1
-	iptables -t nat -D OUTPUT -p udp --dport 53 -j REDIRECT --to-ports $dnslistenport >/dev/null 2>&1
-	iptables -t nat -D OUTPUT -p tcp -m mark --mark "$ip_prefix_hex" -j merlinclash_EXT >/dev/null 2>&1
-	iptables -t nat -D OUTPUT -p tcp -m mark --mark "$opvpn_prefix_hex" -j merlinclash_EXT >/dev/null 2>&1
-	iptables -t nat -D OUTPUT -p tcp -m mark --mark "$pptpvpn_prefix_hex" -j merlinclash_EXT >/dev/null 2>&1
-	iptables -t nat -D OUTPUT -p tcp -m mark --mark "$ipsec_prefix_hex" -j merlinclash_EXT >/dev/null 2>&1
-	iptables -t nat -D OUTPUT -p tcp -m set --match-set router dst -j merlinclash >/dev/null 2>&1
-	iptables -t nat -D OUTPUT -p tcp -j merlinclash >/dev/null 2>&1
-	iptables -t nat -F merlinclash_OUTPUT >/dev/null 2>&1
-	iptables -t nat -X merlinclash_OUTPUT >/dev/null 2>&1
-	
-	iptables -t nat -F merlinclash >/dev/null 2>&1 && iptables -t nat -X merlinclash >/dev/null 2>&1
-	iptables -t nat -F merlinclash_NOR >/dev/null 2>&1 && iptables -t nat -X merlinclash_NOR >/dev/null 2>&1
-	iptables -t nat -F merlinclash_CHN >/dev/null 2>&1 && iptables -t nat -X merlinclash_CHN >/dev/null 2>&1
-	iptables -t nat -F merlinclash_EXT >/dev/null 2>&1 && iptables -t nat -X merlinclash_EXT >/dev/null 2>&1
-	iptables -t mangle -F merlinclash >/dev/null 2>&1 && iptables -t mangle -X merlinclash >/dev/null 2>&1
-	iptables -t mangle -F merlinclash_NOR >/dev/null 2>&1 && iptables -t mangle -X merlinclash_NOR >/dev/null 2>&1
-	iptables -t mangle -F merlinclash_CHN >/dev/null 2>&1 && iptables -t mangle -X merlinclash_CHN >/dev/null 2>&1
-	iptables -t mangle -F merlinclash_divert >/dev/null 2>&1 && iptables -t mangle -X merlinclash_divert >/dev/null 2>&1
-	iptables -t mangle -F merlinclash_PREROUTING >/dev/null 2>&1 && iptables -t mangle -X merlinclash_PREROUTING >/dev/null 2>&1
-	iptables -t mangle -D OUTPUT -j merlinclash_OUTPUT >/dev/null 2>&1
-	iptables -t mangle -F merlinclash_OUTPUT >/dev/null 2>&1
-	iptables -t mangle -X merlinclash_OUTPUT >/dev/null 2>&1
-	ip6tables -t mangle -F merlinclash_OUTPUT >/dev/null 2>&1
-	ip6tables -t mangle -X merlinclash_OUTPUT >/dev/null 2>&1
-	ip6tables -t mangle -F merlinclash_NOR >/dev/null 2>&1 && ip6tables -t mangle -X merlinclash_NOR >/dev/null 2>&1
-	ip6tables -t mangle -F merlinclash_CHN >/dev/null 2>&1 && ip6tables -t mangle -X merlinclash_CHN >/dev/null 2>&1
-	ip6tables -t mangle -F merlinclash >/dev/null 2>&1 && ip6tables -t mangle -X merlinclash >/dev/null 2>&1
-	ip6tables -t mangle -F merlinclash_PREROUTING >/dev/null 2>&1 && ip6tables -t mangle -X merlinclash_PREROUTING >/dev/null 2>&1
-	ip6tables -t mangle -F merlinclash_divert >/dev/null 2>&1 && ip6tables -t mangle -X merlinclash_divert >/dev/null 2>&1
-	ip6tables -t mangle -D PREROUTING -p tcp -j merlinclash_divert >/dev/null 2>&1
-	ip6tables -t mangle -D PREROUTING -p udp -j merlinclash_divert >/dev/null 2>&1
-	ip6tables -t mangle -D PREROUTING -p tcp -j merlinclash_PREROUTING >/dev/null 2>&1
-	ip6tables -t mangle -D PREROUTING -p udp -j merlinclash_PREROUTING >/dev/null 2>&1
-	ip6tables -t mangle -D OUTPUT -j merlinclash_OUTPUT >/dev/null 2>&1
-	ip6tables -t mangle -D PREROUTING -p udp --dport 53 -m set --match-set lan_mac_blacklist src -j DROP >/dev/null 2>&1
-	#清除mangle表中的家长管理规则
-	iptables -t mangle -S PREROUTING | grep PControls | sed 's/-A/-D/g' | while read -r line; do iptables -t mangle $line; done >/dev/null 2>&1
-	ip6tables -t mangle -S PREROUTING | grep PControls | sed 's/-A/-D/g' | while read -r line; do ip6tables -t mangle $line; done >/dev/null 2>&1
-	iptables -t mangle -F PControls >/dev/null 2>&1
-	iptables -t mangle -X PControls >/dev/null 2>&1
-	ip6tables -t mangle -F PControls >/dev/null 2>&1
-	ip6tables -t mangle -X PControls >/dev/null 2>&1
-
-	iptables -t nat -F merlinclash >/dev/null 2>&1 && iptables -t nat -X merlinclash >/dev/null 2>&1
-	iptables -t nat -F merlinclash_EXT >/dev/null 2>&1 && iptables -t nat -X merlinclash_EXT >/dev/null 2>&1
 	#echo_date 删除ip route规则.
-	ip rule del fwmark 1 lookup 100 >/dev/null 2>&1
-	ip route del local default dev lo table 100 >/dev/null 2>&1
-	ip -4 route del local default dev lo table 233 >/dev/null 2>&1
-	ip -4 rule del fwmark 0x2333         table 233 >/dev/null 2>&1
-	ip -4 rule del fwmark 0x1111         table 233 >/dev/null 2>&1
-	ip -6 route del local default dev lo table 233 >/dev/null 2>&1
-	ip -6 rule del fwmark 0x2333         table 233 >/dev/null 2>&1
-	ip -6 rule del fwmark 0x1111         table 233 >/dev/null 2>&1
+    mc_clean_policy() {
+        local family="$1" snapshot records priority mark unavailable=0
+        snapshot=$(ip "$family" rule show 2>&1) || {
+            # This kernel can lack the IPv6 RPDB while IPv6 routes remain usable.
+            # Only the exact native unsupported-family reply proves no rules.
+            if [ "$family" = -6 ] && [ "$snapshot" = 'RTNETLINK answers: Address family not supported by protocol
+Dump terminated' ]; then
+                snapshot=; unavailable=1
+            else
+                return 1
+            fi
+        }
+        # Missing selector attributes are wildcards for deletion. Refuse a
+        # priority collision rather than remove an unrelated scoped neighbor.
+        printf '%s\n' "$snapshot" | awk '
+            $1 ~ /^[0-9]+:$/ {
+                source=0; mark=""; table=0
+                # Keyword-valued interfaces must not overwrite selector keys.
+                for(i=2;i<NF;i++) {
+                    if($i=="from" && $(i+1)=="all") source=1
+                    if($i=="fwmark" && $(i+1) ~ /^0x(2333|1111)(\/0xffffffff)?$/) mark=$(i+1)
+                    if($i=="lookup" && $(i+1)=="233") table=1
+                }
+                if(source && mark!="" && table) {
+                    sub(/\/0xffffffff$/,"",mark)
+                    key=$1 ":" mark
+                    if(NF==7 && $2=="from" && $4=="fwmark" && $6=="lookup") wanted[key]=1
+                    else conflict[key]=1
+                }
+            }
+            END {for(key in wanted) if(conflict[key]) exit 1; exit 0}
+        ' || return 1
+        records=$(printf '%s\n' "$snapshot" | awk '
+            NF==7 && $1 ~ /^[0-9]+:$/ && $2=="from" && $3=="all" && $4=="fwmark" && $5 ~ /^0x(2333|1111)(\/0xffffffff)?$/ && $6=="lookup" && $7=="233" {
+                sub(/:$/,"",$1); sub(/\/0xffffffff$/,"",$5); print $1, $5 "/0xffffffff"
+            }
+        ')
+        printf '%s\n' "$records" | while read -r priority mark; do
+            [ -n "$priority" ] || continue
+            ip "$family" rule del priority "$priority" from all fwmark "$mark" lookup 233 >/dev/null 2>&1 || return 1
+        done || return 1
+        if [ "$unavailable" = 0 ]; then
+            snapshot=$(ip "$family" rule show 2>/dev/null) || return 1
+            printf '%s\n' "$snapshot" | awk '
+                NF==7 && $1 ~ /^[0-9]+:$/ && $2=="from" && $3=="all" && $4=="fwmark" && $5 ~ /^0x(2333|1111)(\/0xffffffff)?$/ && $6=="lookup" && $7=="233" {found=1}
+                END {exit(found ? 0 : 1)}
+            ' && return 1
+        fi
+        ip "$family" route del local default dev lo table 233 >/dev/null 2>&1 || :
+        snapshot=$(ip "$family" route show table 233 2>/dev/null) || return 1
+        printf '%s\n' "$snapshot" | awk '
+            $1=="local" && $2=="default" && $3=="dev" && $4=="lo" {found=1}
+            END {exit(found ? 0 : 1)}
+        ' && return 1
+        return 0
+    }
+    mc_clean_policy -4 || return 1
+    mc_clean_policy -6 || return 1
 	#
 	echo_date "清除ipset规则集" >> $LOG_FILE
 	ipset -F direct_list >/dev/null 2>&1 && ipset -X direct_list >/dev/null 2>&1
@@ -2310,65 +2141,116 @@ restart_firewall() {
 }
 
 close_in_five() {
-	echo_date "插件将在5秒后自动关闭！！" >> $LOG_FILE
-	local i=5
-	while [ $i -ge 0 ]; do
-		sleep 1s
-		echo_date $i
-		let i--
-	done
-	
-	stop_config >/dev/null 2>&1
-
-	echo_date "🔴Magic Catling已关闭！！" >> $LOG_FILE
-	echo_date ======================= Magic Catling ======================= >> $LOG_FILE
-	unset_lock
-	echo BBABBBBC >> /tmp/upload/merlinclash_log.txt
-	exit
+    echo_date "Startup failed; preserving recovery intent and rollback profile" >> "$LOG_FILE"
+    exit 1
 }
 
 stop_config(){
+    local p active previous="$yamlpath" stopstatus=0
+    MC_STOP_APPLIED=0
+    p=$(mc_core_pids | head -1)
+    if [ -n "$p" ]; then
+        active=$(tr '\000' '\n' < "/proc/$p/cmdline" | awk 'found {print; exit} $0=="-f" {found=1}')
+        if [ -s "$active" ]; then yamlpath="$active"; get_ports; yamlpath="$previous"; fi
+    fi
+	dbus set merlinclash_recovery_wanted=0 # explicit stop cancels recovery
 	echo_date 触发脚本stop_config >> $LOG_FILE
 	echo_date ======================= Magic Catling ======================= >> $LOG_FILE
 	echo_date ---------------------- 🔴关闭相关程序 ---------------------- >> $LOG_FILE
 	kill_cron_job
 	clean_ipset
 	dbus set merlinclash_enable="0"
-	[ "${merlinclash_ipt_closeproxy_sw}" != "1" ] && restart_dnsmasq
-	kill_process
+	if [ "${merlinclash_ipt_closeproxy_sw}" != "1" ] || mc_owned_state_present --dns-only; then
+		restart_dnsmasq || stopstatus=1
+	fi
+	kill_process || stopstatus=1
+    mc_cleanup_ai || stopstatus=1
 	echo_date -------------------- 🔴清除iptables规则 -------------------- >> $LOG_FILE
-	flush_nat
+	flush_nat || stopstatus=1
+    if [ -n "$(mc_core_pids)" ] || mc_owned_state_present; then stopstatus=1; fi
+    if [ "$stopstatus" = 0 ]; then MC_STOP_APPLIED=1; fi
+    return "$stopstatus"
+}
+
+maintenance_stop(){
+    local prior="$mcenable" stopstatus=0
+    kill_cron_job
+    clean_ipset
+    kill_process || stopstatus=1
+    mc_cleanup_ai || stopstatus=1
+    flush_nat || stopstatus=1
+    mcenable=0
+    if [ "${merlinclash_ipt_closeproxy_sw}" != 1 ] || mc_owned_state_present --dns-only; then
+        restart_dnsmasq || stopstatus=1
+    fi
+    mcenable="$prior"
+    if [ -n "$(mc_core_pids)" ] || mc_owned_state_present; then stopstatus=1; fi
+    return "$stopstatus"
 }
 
 ### 主流程
 apply_mc() {
 	echo_date ======================= Magic Catling ======================= >> $LOG_FILE
 	echo_date ------------------------ 🟠启动准备 ------------------------ >> $LOG_FILE
-	check_ss #兼容检查
+	check_ss || return 1
+    local livepath="$MC_ROOT/yaml_use/$yamlname.yaml" candidate rc
+    candidate=$(mc_mktemp "$MC_ROOT/yaml_use/.${yamlname}.prepare.XXXXXX") || return 1
+    yamlpath="$candidate"
+    (
+        set -e
+        check_yaml
+        check_rule || return 1
+        check_dnsplan
+        set_Tolerance
+        check_coremark
+        start_custom
+        mc_validate_yaml "$yamlpath"
+    )
+    rc=$?
+    yamlpath="$livepath"
+    if [ "$rc" != 0 ]; then rm -f "$candidate"; return "$rc"; fi
+    # Keep a verified rollback profile before atomic publication.
+    [ ! -e "$livepath" ] || cp -p "$livepath" "$livepath.last-good" || { rm -f "$candidate"; return 1; }
+    chmod 600 "$candidate" && mv -f "$candidate" "$livepath" || return 1
+    MC_PROFILE_COMMITTED=1
+	apply_dns_settings
 	clean_ipset	#清除ipset
-	kill_process #关闭进程
+	kill_process || return 1 #关闭进程
 	kill_cron_job #关闭定时任务
-	flush_nat #清除iptables规则
-	[ "${merlinclash_ipt_closeproxy_sw}" != "1" ] && restart_dnsmasq #重启dnsmasq
+	flush_nat || return 1 #清除iptables规则
+	if [ "${merlinclash_ipt_closeproxy_sw}" != "1" ] || mc_owned_state_present --dns-only; then
+		restart_dnsmasq || return 1
+	fi
 	echo_date ------------------------ 🟢开始启动 ------------------------ >> $LOG_FILE
 	echo_date ---------------------- 📌设置启动参数 ---------------------- >> $LOG_FILE
-	check_yaml	#检查合并yaml文件
-	check_rule	#拼合自定义规则
-	check_dnsplan	#检查DNS方案
-	set_Tolerance 	#设置延迟容差
-	check_coremark	#检查内核代理组状态
-	start_custom	#设置启动参数
+
+
+
+
+
+
+	check_coremark
 	get_ports	#获取端口号
 	echo_date ---------------------- 📌创建ipset规则 --------------------- >> $LOG_FILE
-	creat_ipset	#创建相关ipset规则
+	if [ "${merlinclash_ipt_closeproxy_sw}" != "1" ]; then creat_ipset || return 1; fi	#创建相关ipset规则
 	set_sys	#启动增熵
 	echo_date ---------------------- 📌启动Mihomo内核 --------------------- >> $LOG_FILE
-	start_clash	#启动内核
-	start_remark	#恢复记忆节点
+    if [ "$(dbus get merlinclash_enable)" != 1 ] && [ "$(dbus get merlinclash_recovery_wanted)" != 1 ]; then
+        MC_PROFILE_COMMITTED=0
+        stop_config
+        return $?
+    fi
+	start_clash || return 1
+	start_remark || return 1
 	[ "${merlinclash_ipt_closeproxy_sw}" != "1" ] && echo_date --------------------- 📌创建iptables规则 -------------------- >> $LOG_FILE
-	[ "${merlinclash_ipt_closeproxy_sw}" != "1" ] && load_nat
-	[ "${merlinclash_ipt_closeproxy_sw}" != "1" ] && restart_dnsmasq #重启dnsmasq
+	if [ "${merlinclash_ipt_closeproxy_sw}" != "1" ]; then load_nat || return 1; fi
+	if [ "${merlinclash_ipt_closeproxy_sw}" != "1" ]; then
+		restart_dnsmasq || return 1
+	fi
 	echo_date ----------------------- 📌启动后处理 ------------------------ >> $LOG_FILE
+	/jffs/scripts/chatgpt-http3.sh || return 1
+	cru a clash_watchdog "* * * * * /bin/sh /jffs/softcenter/scripts/clash_watchdog.sh"
+    cru a merlinclash_autoupdate "30 4 * * * /bin/sh /jffs/softcenter/scripts/merlinclash_autoupdate.sh"
 	write_setmark_cron_job #节点后台记忆
 	write_update_yaml_cron #定时订阅
 	write_clash_restart_cron_job #定时重启
@@ -2389,89 +2271,179 @@ apply_mc() {
 
 apply_nat() {
 	echo_date --------------------- 🔴清除iptables规则 -------------------- >> $LOG_FILE
-	flush_nat
+	flush_nat || return 1
 	echo_date ---------------------- 📌创建ipset规则 ---------------------- >> $LOG_FILE
 	clean_ipset
-	creat_ipset
+	if [ "${merlinclash_ipt_closeproxy_sw}" != "1" ]; then creat_ipset || return 1; fi
 	get_ports
 	[ "${merlinclash_ipt_closeproxy_sw}" != "1" ] && echo_date --------------------- 📌创建iptables规则 -------------------- >> $LOG_FILE
-	[ "${merlinclash_ipt_closeproxy_sw}" != "1" ] && load_nat
-	[ "${merlinclash_ipt_closeproxy_sw}" != "1" ] && restart_dnsmasq
+	if [ "${merlinclash_ipt_closeproxy_sw}" != "1" ]; then load_nat || return 1; fi
+	if [ "${merlinclash_ipt_closeproxy_sw}" != "1" ] || mc_owned_state_present --dns-only; then
+		restart_dnsmasq || return 1
+	fi
 	echo_date "=============== Magic Catling iptable 重写完成===============" >> $LOG_FILE
 }
 
-case $ACTION in
+# Read settings again only after acquiring the lifecycle mutex.
+request=${2:-${1:-}}
+case "$request" in start|start_nat|stop|restart) ;; *) exit 2 ;; esac
+MC_CLEANUP_ONLY=0
+[ "$request" != stop ] || MC_CLEANUP_ONLY=1
+if { [ "$request" = stop ] && [ "${1:-}" != maintenance ]; } || { [ "$request" = start ] && [ -n "${2:-}" ] && [ "$(dbus get merlinclash_enable)" != 1 ]; }; then
+    # UI Off is durable even if another workflow currently owns the lock.
+    dbus set "merlinclash_stop_token=$(date +%s).$$"
+    dbus set merlinclash_enable=0
+    dbus set merlinclash_recovery_wanted=0
+    MC_CLEANUP_ONLY=1
+fi
+if [ "$MC_CLEANUP_ONLY" = 1 ]; then mc_lock --cleanup-only; else mc_lock; fi
+lock_status=$?
+[ "$lock_status" = 0 ] || exit "$lock_status"
+MC_STOP_TOKEN=$(dbus get merlinclash_stop_token)
+MC_WAS_RUNNING=0
+[ -z "$(mc_core_pids)" ] || MC_WAS_RUNNING=1
+MC_PREVIOUS_PROFILE=$(mc_active_name)
+MC_PREVIOUS_CFG=$(mc_active_config)
+mc_controller_cleanup() {
+    local status=$? restored rollback_source= rollback_profile="$yamlname" rollback_mark=
+    trap - EXIT
+    if [ "$(dbus get merlinclash_stop_token)" != "$MC_STOP_TOKEN" ] || { [ "$(dbus get merlinclash_enable)" = 0 ] && [ "$(dbus get merlinclash_recovery_wanted)" != 1 ]; }; then
+        if [ "${MC_STOP_APPLIED:-0}" != 1 ]; then stop_config || status=1; fi
+        mc_unlock
+        exit "$status"
+    fi
+    if [ "$status" != 0 ] && [ "${MC_PROFILE_COMMITTED:-0}" = 1 ]; then
+        restored="$MC_ROOT/yaml_use/$yamlname.yaml.last-good"
+        if mc_validate_yaml "$restored"; then
+            cp -p "$restored" "$restored.restore" && mv -f "$restored.restore" "$MC_ROOT/yaml_use/$yamlname.yaml"
+            rollback_source="$restored"
+        fi
+        if [ "$MC_WAS_RUNNING" = 1 ] && [ "${MC_ROLLBACK_PASS:-0}" != 1 ]; then
+            if [ -n "$MC_PREVIOUS_PROFILE" ] && mc_validate_yaml "$MC_PREVIOUS_CFG.active-last-good"; then
+                rollback_source="$MC_PREVIOUS_CFG.active-last-good"
+                rollback_profile="$MC_PREVIOUS_PROFILE"
+                if [ "${MC_REQUEST_PROFILE+x}" != x ]; then
+                    dbus set "merlinclash_set_yamlsel_start=$MC_PREVIOUS_PROFILE"
+                    dbus set "merlinclash_yamlsel=$MC_PREVIOUS_PROFILE"
+                fi
+            fi
+            if [ -n "$rollback_source" ]; then
+                [ "${MC_FRESH_MARK_PROFILE:-}" != "$rollback_profile" ] || rollback_mark="$rollback_profile"
+                MC_FRESH_MARK_PROFILE="$rollback_mark" MC_ROLLBACK_PASS=1 MC_REQUEST_PROFILE="$rollback_profile" MC_FORCE_SOURCE="$rollback_source" sh /jffs/softcenter/scripts/clash_config.sh rollback restart >> "$LOG_FILE" 2>&1
+            fi
+        fi
+    fi
+    mc_unlock
+    exit "$status"
+}
 
-start)
-	set_lock
-	#日志自动删除，防止长时间未重启文件过大
-	sh /jffs/softcenter/scripts/clash_logautodel.sh
-	if [ "${merlinclash_enable}" == "1" ];then
-		if [ "${merlinclash_set_startdelay_sw}" == "1" ]; then		
-			sleeptime=${merlinclash_set_startdelay_val}
-			logger "[软件中心-开机自启]: Magic Catling 自启推迟:$sleeptime秒！"
-			sleep ${sleeptime}s
-			logger "[软件中心-开机自启]: Magic Catling 自启推迟:$sleeptime秒 结束！"
-		fi
-		apply_mc >>"$LOG_FILE"
-	else
-		logger "[软件中心-开机自启]: Magic Catling 未设置开机启动！"
-	fi
-	unset_lock
-	;;
+trap 'mc_controller_cleanup' EXIT
+trap 'exit 1' HUP INT TERM
+eval $(dbus export merlinclash_)
+# A UI Off request may be followed by On while waiting for the mutex. Any
+# resulting start still requires publication recovery before touching profiles.
+if [ "$MC_CLEANUP_ONLY" = 1 ] && [ "$request" != stop ] &&
+   { [ "$merlinclash_enable" = 1 ] || [ "$merlinclash_recovery_wanted" = 1 ]; }; then
+    mc_recover_profiles || exit 1
+fi
+mcrm=${merlinclash_ipt_routingmark_val:-524288}
+case "$mcrm" in *[!0-9]*) mcrm=524288 ;; esac
+### 全局变量赋值
+mcenable=${merlinclash_enable}
+dnshijacksel=${merlinclash_dns_dnshijack_sw}
+dfib=${merlinclash_dns_fakeip_server}
+cusruleplan=${merlinclash_acl_plan}
+retryTimes=${merlinclash_set_logcheck_val}
+tproxymode=${merlinclash_ipt_tproxy_type}
+cirswitch=${merlinclash_set_chnroute_sw}
+ipv6switch=${merlinclash_ipt_ipv6_sw}
+dnsplan=${merlinclash_dns_type}
+dnsgoclash=${merlinclash_ipt_proxyrouter_sw}
+dnsinclash=${merlinclash_dns_proxydns_sw}
 
-start_nat)
-	set_lock
-	logger "[软件中心-NAT重启]: IPTABLES发生变化，Magic Catling NAT重启！"
-	echo_date "[软件中心-NAT重启]: IPTABLES发生变化，Magic Catling NAT重启！" >> $LOG_FILE
-	echo_date "[软件中心-NAT重启]: Magic Catling开关状态为：【${merlinclash_enable}】" >> $LOG_FILE
-	if [ "${merlinclash_enable}" == "1" -a "$(pidof clash)" -a "$(netstat -anp | grep clash | head -n 5)" -a ! -n "$(grep "Parse config error" /tmp/clash_run.log)" ]; then	
-		logger "[软件中心-NAT重启]: Magic Catling 完全启动，开始重写dns配置和iptables"
-		echo_date "[软件中心-NAT重启]: Magic Catling 完全启动，开始重写dns配置和iptables" >> $LOG_FILE
-		apply_nat >>"$LOG_FILE"
-	else
-		logger "[软件中心-NAT重启]: Magic Catling 插件未开启或Clash未完全启动，终止写入dns配置和iptables"
-		echo_date "[软件中心-NAT重启]: Magic Catling 插件未开启或Clash未完全启动，终止写入dns配置和iptables" >> $LOG_FILE
-	fi
-	unset_lock
-	;;
-esac
 
-case $2 in
-start)
-	echo "" > /tmp/upload/merlinclash_log.txt
-	http_response "$1"
-	set_lock
-	if [ "${merlinclash_enable}" == "1" ];then
+if [ "$request" = start_nat ] && [ -n "$(mc_core_pids)" ]; then
+    yamlname=$(mc_active_name) || exit 1
+elif { [ "$request" = start ] || [ "$request" = restart ]; } && [ "${MC_REQUEST_PROFILE+x}" = x ]; then
+    yamlname=$MC_REQUEST_PROFILE
+    mc_valid_name "$yamlname" || exit 1
+else
+    yamlname=$(mc_selected) || { [ "$request" = stop ] && yamlname=disabled || exit 1; }
+fi
+yamlpath="$MC_ROOT/yaml_use/$yamlname.yaml"
+mcenable=${merlinclash_enable}
+case "$request" in
+    stop) if [ "${1:-}" = maintenance ]; then maintenance_stop; else stop_config; fi ;;
+    start_nat)
+        [ "$mcenable" = 1 ] && [ -n "$(mc_core_pids)" ] || exit 0
+        apply_nat >>"$LOG_FILE" || exit $?
+        /jffs/scripts/chatgpt-http3.sh || exit $?
+        ;;
+    start|restart)
+        if [ "$mcenable" != 1 ]; then
+            if [ "$request" = restart ] && [ "$(dbus get merlinclash_recovery_wanted)" = 1 ]; then
+                dbus set merlinclash_enable=1
+                mcenable=1
+            else
+                if [ "$request" = start ] && [ -n "$2" ]; then
+                    stop_config || exit 1
+                fi
+                exit 0
+            fi
+        fi
+        if [ "$request" = start ] && [ -z "${2:-}" ] && [ "${merlinclash_set_startdelay_sw}" = 1 ]; then
+            delay=${merlinclash_set_startdelay_val}
+            case "$delay" in ''|*[!0-9]*) exit 1 ;; esac
+            [ "$delay" -le 3600 ] || exit 1
+            # Off is durable before its caller attempts the lifecycle lock.
+            # Observe cancellation while retaining this owner's cleanup trap.
+            while :; do
+                if [ "$(dbus get merlinclash_stop_token)" != "$MC_STOP_TOKEN" ] ||
+                   { [ "$(dbus get merlinclash_enable)" = 0 ] && [ "$(dbus get merlinclash_recovery_wanted)" != 1 ]; }; then
+                    exit 0
+                fi
+                [ "$delay" -gt 0 ] || break
+                sleep 1 || exit 1
+                delay=$((delay-1))
+            done
+        fi
+        # Save the current manual selector choices immediately before stopping.
+        if [ -n "$(mc_core_pids)" ] && [ "${MC_ROLLBACK_PASS:-0}" != 1 ]; then
+            mark_profile=${MC_PREVIOUS_PROFILE:-$yamlname}
+            if sh /jffs/softcenter/scripts/clash_node_mark.sh setmark; then
+                MC_FRESH_MARK_PROFILE=
+                [ "$(dbus get merlinclash_stop_token)" = "$MC_STOP_TOKEN" ] || exit 0
+                if [ "$(dbus get merlinclash_enable)" = 1 ]; then
+                    captured_profile=$(mc_active_name) && mc_valid_name "$captured_profile" &&
+                        [ "$captured_profile" = "$mark_profile" ] || exit 1
+                    MC_FRESH_MARK_PROFILE="$captured_profile"
+                fi
+            else
+                MC_FRESH_MARK_PROFILE=
+                if mc_saved_mark_valid "$MC_ROOT/mark/$mark_profile.txt"; then
+                    echo_date "Selector API unavailable; retained validated saved selectors for $mark_profile, fresh choices were not captured" >> "$LOG_FILE"
+                elif [ -n "$MC_PREVIOUS_CFG" ] && [ "$(yq e '.profile.store-selected == true' "$MC_PREVIOUS_CFG" 2>/dev/null)" = true ]; then
+                    echo_date "Selector API unavailable; using native saved selections, fresh choices were not captured" >> "$LOG_FILE"
+                else
+                    echo_date "Selector API unavailable and no validated prior selector record or native persistence; selections may reset to defaults" >> "$LOG_FILE"
+                fi
+            fi
+            if [ -n "$MC_PREVIOUS_CFG" ] && mc_validate_yaml "$MC_PREVIOUS_CFG"; then
+                cp -p "$MC_PREVIOUS_CFG" "$MC_PREVIOUS_CFG.active-last-good" && chmod 600 "$MC_PREVIOUS_CFG.active-last-good" || exit 1
+            fi
+        fi
+        [ -z "${2:-}" ] || http_response "$1"
         apply_mc
-	else
-		stop_config
-		echo_date >> $LOG_FILE
-		echo_date 你已经成功关闭Magic Catling~ >> $LOG_FILE
-		echo_date See you again! >> $LOG_FILE
-		echo_date >> $LOG_FILE
-		echo_date ======================= Magic Catling ======================= >> $LOG_FILE
-	fi
-	unset_lock
-	echo BBABBBBC >> /tmp/upload/merlinclash_log.txt
-	;;
-stop)
-	stop_config
-	echo_date >> $LOG_FILE
-	echo_date 你已经成功关闭Magic Catling~ >> $LOG_FILE
-	echo_date See you again! >> $LOG_FILE
-	echo_date >> $LOG_FILE
-	echo_date ======================= Magic Catling ======================= >> $LOG_FILE
-	;;
-restart)
-	if [ "${merlinclash_enable}" == "1" ];then
-        apply_mc
-	else
-		stop_config
-		echo_date >> $LOG_FILE
-		echo_date 你已经成功关闭Magic Catling~ >> $LOG_FILE
-		echo_date See you again! >> $LOG_FILE
-		echo_date >> $LOG_FILE
-	fi
-	;;
+        rc=$?
+        [ "$rc" = 0 ] || exit "$rc"
+        if [ "$(dbus get merlinclash_enable)" != 1 ] && [ "$(dbus get merlinclash_recovery_wanted)" != 1 ]; then
+            MC_PROFILE_COMMITTED=0
+            stop_config
+            exit $?
+        fi
+        sh /jffs/softcenter/scripts/clash_watchdog.sh --check || exit 1
+        MC_PROFILE_COMMITTED=0
+        dbus set merlinclash_recovery_wanted=0
+        echo BBABBBBC >> "$LOG_FILE"
+        ;;
 esac

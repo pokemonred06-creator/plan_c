@@ -1,56 +1,41 @@
 #!/bin/sh
-
-source /jffs/softcenter/scripts/base.sh
-source /jffs/softcenter/scripts/clash_base.sh
-eval $(dbus export merlinclash_)
-alias echo_date='echo 【$(date +%Y年%m月%d日\ %X)】:'
+. /jffs/softcenter/scripts/base.sh
+. /jffs/softcenter/scripts/clash_safe.sh
 LOG_FILE=/tmp/upload/merlinclash_log.txt
-LOCK_FILE=/tmp/yaml_online_del.lock
 
-
-start_online_del(){
-    rm -rf $LOG_FILE
-    echo_date ======================== 删除YAM配置 ======================== >> $LOG_FILE
-    echo_date "📌定位yaml文件" >> $LOG_FILE
-
-    #delpath1=/jffs/softcenter/merlinclash
-    delpath1=/jffs/softcenter/merlinclash/yaml_use
-    delpath2=/jffs/softcenter/merlinclash/yaml_bak
-    rulepath=/jffs/softcenter/merlinclash/rule_bak
-    markpath=/jffs/softcenter/merlinclash/mark
-    marktmp=/tmp/clash/mark
-    yamlname=$(get merlinclash_set_yamlsel_edit)
-
-    rm -rf $delpath1/$yamlname.yaml >/dev/null 2>&1
-    rm -rf $delpath2/$yamlname.yaml >/dev/null 2>&1
-    rm -rf $delpath2/$yamlname >/dev/null 2>&1
-    rm -rf $delpath2/${yamlname}.dlinks >/dev/null 2>&1
-    rm -rf $rulepath/${yamlname}_rules.yaml >/dev/null 2>&1
-    rm -rf $rulepath/${yamlname}_custom_rule.yaml >/dev/null 2>&1
-    rm -rf $markpath/${yamlname}.txt >/dev/null 2>&1
-    rm -rf $marktmp/clash_web_save_${yamlname}.txt >/dev/null 2>&1
-
-    echo_date "🟠删除yaml文件" >> $LOG_FILE
-
-    echo_date "🟠重建yaml文件列表" >> $LOG_FILE
-    rm -rf $delpath2/yamls.txt >/dev/null 2>&1
-    rm /tmp/upload/yamls.txt >/dev/null 2>&1
-    find $delpath2 -name "*.yaml" |sed 's#.*/##' |sed '/^$/d' | awk -F'.' '{print $1}' >> $delpath2/yamls.txt
-    #创建软链接
-    ln -sf $delpath2/yamls.txt /tmp/upload/yamls.txt
-    #
-    dbus remove merlinclash_${yamlname}
-    
-    echo_date "✅配置文件删除完毕" >>"$LOG_FILE"
-    echo_date ======================== 删除YAM配置 ======================== >> $LOG_FILE
+delete_profile() {
+    yamlname=$(dbus get merlinclash_set_yamlsel_edit)
+    mc_valid_name "$yamlname" || { echo 'Invalid profile name' >> "$LOG_FILE"; return 1; }
+    mc_lock || return 1
+    trap 'mc_unlock' EXIT
+    trap 'exit 1' HUP INT TERM
+    selected=$(dbus get merlinclash_set_yamlsel_start)
+    legacy_selected=$(dbus get merlinclash_yamlsel)
+    active=$(mc_active_name) || active=
+    if [ "$yamlname" = "$selected" ] || [ "$yamlname" = "$legacy_selected" ] || [ "$yamlname" = "$active" ]; then
+        echo 'Select another profile before deleting this profile' >> "$LOG_FILE"
+        return 1
+    fi
+    root=/jffs/softcenter/merlinclash
+    # Remove only exact validated profile paths, never an empty directory prefix.
+    rm -f "$root/yaml_use/$yamlname.yaml" "$root/yaml_bak/$yamlname.yaml" \
+        "$root/yaml_bak/$yamlname.dlinks" "$root/rule_bak/${yamlname}_rules.yaml" \
+        "$root/rule_custom/${yamlname}_custom_rule.yaml" "$root/mark/$yamlname.txt" \
+        "/tmp/clash/mark/clash_web_save_${yamlname}.txt" || return 1
+    rm -rf "$root/yaml_bak/$yamlname" || return 1
+    list=$(mc_mktemp "$root/yaml_bak/.yamls.XXXXXX") || return 1
+    for profile in "$root"/yaml_bak/*.yaml; do
+        [ -f "$profile" ] || continue
+        profile=${profile##*/}; profile=${profile%.yaml}
+        mc_valid_name "$profile" && printf '%s\n' "$profile"
+    done > "$list"
+    mv -f "$list" "$root/yaml_bak/yamls.txt" || { rm -f "$list"; return 1; }
+    ln -sf "$root/yaml_bak/yamls.txt" /tmp/upload/yamls.txt || return 1
 }
-case $2 in
-0)
-    set_lock
-	echo "" > $LOG_FILE
-	http_response "$1"
-	start_online_del >> $LOG_FILE
-	echo BBABBBBC >> $LOG_FILE
-	unset_lock
-	;;
+case "$2" in
+    0)
+        http_response "$1"
+        if delete_profile; then http_response success; else http_response failed; exit 1; fi
+        echo BBABBBBC >> "$LOG_FILE"
+        ;;
 esac

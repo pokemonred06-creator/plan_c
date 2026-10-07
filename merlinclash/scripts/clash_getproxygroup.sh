@@ -1,79 +1,29 @@
 #!/bin/sh
-
-source /jffs/softcenter/scripts/base.sh
-source /jffs/softcenter/scripts/clash_base.sh
-eval $(dbus export merlinclash_)
-alias echo_date='echo 【$(date +%Y年%m月%d日\ %X)】:'
-
-yamlname=$(get merlinclash_set_yamlsel_start)
-#配置文件路径
-yamlpath=/jffs/softcenter/merlinclash/yaml_use/$yamlname.yaml
-lan_ipaddr=$(nvram get lan_ipaddr)
-#提取配置认证码
-if [ -s "$yamlpath" ] && [ "$(pidof clash)" -a "$(netstat -anp | grep clash | head -n 5)" ]; then
-	rm -rf /tmp/upload/*.mark
-	secret=$(cat $yamlpath | awk '/secret:/{print $2}' | sed 's/"//g')
-	#提取配置监听端口
-	ecport=$(cat $yamlpath | awk -F: '/external-controller/{print $3}')
-	
-	curl -s -X GET "http://$lan_ipaddr:$ecport/proxies" -H "Authorization: Bearer $secret" | sed 's/\},/\},\n/g'  | grep "Selector" |grep -Eo "name.*" > /tmp/upload/${yamlname}.mark
-	filename=/tmp/upload/${yamlname}.mark
-
-		rm -rf /tmp/upload/proxygroups.txt
-		rm -rf /tmp/upload/proxytype.txt
-		lines=$(cat $filename | wc -l)
-		i=1
-		while [ "$i" -le "$lines" ]
-		do
-			line=$(sed -n ''$i'p' "$filename")
-			#echo $line
-			#echo ""
-			names=$(echo $line |grep -o "name.*"|awk -F\" '{print $3}')
-			echo $names >> /tmp/upload/proxygroups.txt
-				let i=i+1
-		done
-		#往头部插入两个连接方式，删除GLOBAL
-		sed -i '/GLOBAL/d' /tmp/upload/proxygroups.txt
-		sed -i "1i\REJECT" /tmp/upload/proxygroups.txt
-		sed -i "1i\DIRECT" /tmp/upload/proxygroups.txt
-		#插入规则类型
-		echo "DOMAIN" >> /tmp/upload/proxytype.txt
-		echo "DOMAIN-SUFFIX" >> /tmp/upload/proxytype.txt
-		echo "DOMAIN-KEYWORD" >> /tmp/upload/proxytype.txt
-		echo "DOMAIN-WILDCARD" >> /tmp/upload/proxytype.txt
-		echo "DOMAIN-REGEX" >> /tmp/upload/proxytype.txt
-		echo "GEOSITE" >> /tmp/upload/proxytype.txt
-
-		echo "IP-CIDR" >> /tmp/upload/proxytype.txt
-		echo "SRC-IP-CIDR" >> /tmp/upload/proxytype.txt	
-		echo "IP-ASN" >> /tmp/upload/proxytype.txt
-		echo "SRC-IP-ASN" >> /tmp/upload/proxytype.txt
-		echo "IP-SUFFIX" >> /tmp/upload/proxytype.txt
-		echo "SRC-IP-SUFFIX" >> /tmp/upload/proxytype.txt
-		echo "GEOIP" >> /tmp/upload/proxytype.txt
-		echo "SRC-GEOIP" >> /tmp/upload/proxytype.txt
-
-		echo "DST-PORT" >> /tmp/upload/proxytype.txt
-		echo "SRC-PORT" >> /tmp/upload/proxytype.txt
-
-		echo "IN-TYPE" >> /tmp/upload/proxytype.txt
-		echo "IN-PORT" >> /tmp/upload/proxytype.txt
-		echo "IN-USER" >> /tmp/upload/proxytype.txt
-		echo "IN-NAME" >> /tmp/upload/proxytype.txt
-
-		echo "AND" >> /tmp/upload/proxytype.txt
-		echo "OR" >> /tmp/upload/proxytype.txt
-		echo "NOT" >> /tmp/upload/proxytype.txt
-
-		echo "NETWORK" >> /tmp/upload/proxytype.txt
-		echo "DSCP" >> /tmp/upload/proxytype.txt
-		echo "SUB-RULE" >> /tmp/upload/proxytype.txt
-else
-	rm -rf /tmp/upload/proxygroups.txt
-	rm -rf /tmp/upload/proxytype.txt
-	echo "请启动插件" >> /tmp/upload/proxytype.txt
-	echo "请启动插件" >> /tmp/upload/proxygroups.txt		
-fi
-
-http_response $1
-
+. /jffs/softcenter/scripts/base.sh
+. /jffs/softcenter/scripts/clash_safe.sh
+mc_lock || exit $?
+trap 'mc_unlock' EXIT
+trap 'exit 1' HUP INT TERM
+# A pending UI selection may have a different controller or secret. Read the
+# profile actually serving the API while lifecycle changes are serialized.
+cfg=$(mc_active_config) || exit 1
+[ -s "$cfg" ] && [ -n "$(mc_core_pids)" ] || exit 1
+exec 8>/tmp/clash-proxygroup.lock
+flock -n 8 || exit 75
+stage=$(mc_mktemp -d /tmp/clash-proxygroups.XXXXXX) || exit 1
+trap 'rm -rf "$stage"; mc_unlock' EXIT
+secret=$(yq e -r '.secret // ""' "$cfg") || exit 1
+control=$(yq e -r '.external-controller' "$cfg") || exit 1
+case "$control" in 0.0.0.0:*) control="127.0.0.1:${control##*:}" ;; :*) control="127.0.0.1$control" ;; esac
+mc_curl --noproxy '*' -fsS --connect-timeout 2 --max-time 5 -H "Authorization: Bearer $secret" "http://$control/proxies" > "$stage/proxies.json" || exit 1
+jq -e '.proxies | type == "object"' "$stage/proxies.json" >/dev/null || exit 1
+{
+    printf '%s\n' DIRECT REJECT
+    # Automatic groups are valid rule destinations too. The API exposes their
+    # members in "all"; individual proxies and the controller GLOBAL are omitted.
+    jq -r '.proxies | to_entries[] | select((.value.all | type) == "array" and .key != "GLOBAL") | .key' "$stage/proxies.json"
+} > "$stage/groups" || exit 1
+printf '%s\n' DOMAIN DOMAIN-SUFFIX DOMAIN-KEYWORD DOMAIN-WILDCARD DOMAIN-REGEX GEOSITE IP-CIDR SRC-IP-CIDR IP-ASN SRC-IP-ASN IP-SUFFIX SRC-IP-SUFFIX GEOIP SRC-GEOIP DST-PORT SRC-PORT IN-TYPE IN-PORT IN-USER IN-NAME AND OR NOT NETWORK DSCP SUB-RULE > "$stage/types" || exit 1
+cp "$stage/groups" /tmp/upload/proxygroups.txt.new && mv -f /tmp/upload/proxygroups.txt.new /tmp/upload/proxygroups.txt || exit 1
+cp "$stage/types" /tmp/upload/proxytype.txt.new && mv -f /tmp/upload/proxytype.txt.new /tmp/upload/proxytype.txt || exit 1
+http_response "$1"

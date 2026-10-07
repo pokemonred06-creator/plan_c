@@ -147,6 +147,23 @@ install_now(){
 
     fi
 
+	# 检测储存空间是否足够（前置校验，防止空间不足时已删除旧文件导致插件损坏）
+	echo_date "检测jffs分区剩余空间..."
+	SPACE_AVAL=$(df | grep -w "/jffs$" | awk '{print $4}')
+	SPACE_NEED=$(du -s /tmp/merlinclash | awk '{print $1}')
+	if [ "$SPACE_AVAL" -gt "$SPACE_NEED" ];then
+		echo_date "当前jffs分区剩余${SPACE_AVAL}KB, 插件安装大概需要${SPACE_NEED}KB，空间满足，继续安装！"
+	elif [ "$(nvram get sc_mount)" == "1" ];then
+		echo_date "U盘已挂载, 插件安装大概需要${SPACE_NEED}KB，空间满足，继续安装！"
+	else
+		echo_date ""
+		echo_date "======================  ！！异常退出！！ ==========================="
+		echo_date ""
+		echo_date "当前jffs分区剩余${SPACE_AVAL}KB, 插件安装大概需要${SPACE_NEED}KB，空间不足！"
+		echo_date "未修改现有安装文件，请清理JFFS空间或挂载U盘后再试！"
+		exit_install 2
+	fi
+
 	echo_date "清理旧文件"
 	rm -rf /jffs/softcenter/merlinclash/shanghai >/dev/null 2>&1
 	rm -rf /jffs/softcenter/merlinclash/version
@@ -177,33 +194,6 @@ install_now(){
 		echo_date "删除Geo数据库文件，有需要的请升级成功后重新下载！"
 		rm -rf /jffs/softcenter/merlinclash/GeoSite.dat >/dev/null 2>&1
 		rm -rf /jffs/softcenter/merlinclash/GeoIP.dat >/dev/null 2>&1
-	fi
-
-	# 检测储存空间是否足够
-	echo_date "检测jffs分区剩余空间..."
-	SPACE_AVAL=$(df | grep -w "/jffs$" | awk '{print $4}')
-	SPACE_NEED=$(du -s /tmp/merlinclash | awk '{print $1}')
-	if [ "$SPACE_AVAL" -gt "$SPACE_NEED" ];then
-		echo_date "当前jffs分区剩余${SPACE_AVAL}KB, 插件安装大概需要${SPACE_NEED}KB，空间满足，继续安装！"
-	elif [ "$(nvram get sc_mount)" == "1" ];then
-		echo_date "U盘已挂载, 插件安装大概需要${SPACE_NEED}KB，空间满足，继续安装！"
-	else
-		if [ "${mcinstall}" == "1" ]; then
-			echo_date ""
-			echo_date "======================  ！！异常退出！！ ==========================="
-			echo_date ""
-			echo_date "当前jffs分区剩余${SPACE_AVAL}KB, 插件安装大概需要${SPACE_NEED}KB，空间不足！"
-			echo_date "         ++++++++++++++++++++++++++++++++++++++++++++++++++++++"
-			echo_date "         +           注意：安装脚本已删除插件部分重要文件           +" 
-			echo_date "         +   请清理JFFS空间重新安装，或者卸载Magic Catling2全新安装   +" 
-			echo_date "         +        ！！！否则无法正常启动Magic Catling2！！！         +" 
-			echo_date "         ++++++++++++++++++++++++++++++++++++++++++++++++++++++"
-			sleep 5
-			exit_install 2
-		else
-			echo_date "当前jffs分区剩余${SPACE_AVAL}KB, 插件安装大概需要${SPACE_NEED}KB，空间不足！"
-			exit_install 2
-		fi
 	fi
 
 	# 开始安装

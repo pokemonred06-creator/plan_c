@@ -31,17 +31,29 @@ echo_version() {
 	echo -----------------------------------------------------------
 }
 
+watchdog_scheduled() {
+    local jobs
+    [ "$(dbus get merlinclash_enable)" = 1 ] || return 1
+    jobs=$(cru l) || return 1
+    printf '%s\n' "$jobs" | awk '
+        NF == 8 && $6 == "/bin/sh" && $7 == "/jffs/softcenter/scripts/clash_watchdog.sh" && $8 == "#clash_watchdog#" {found=1}
+        NF == 7 && $6 == "/jffs/softcenter/scripts/clash_watchdog.sh" && $7 == "#clash_watchdog#" {found=1}
+        END { exit !found }
+    '
+}
+
 check_status() {
 	#echo
-	pid_clash=$(pidof clash)
-	watchdog=$(ps | grep clash_dog.sh | grep -v grep)
+	pid_clash=$(mc_core_pids)
+	watchdog=0
+	watchdog_scheduled && watchdog=1
 	echo_version
 	echo
 	echo ② 检测当前相关进程工作状态：（你正在使用clash）
 	echo -----------------------------------------------------------
 	echo "程序		状态	PID"
 	[ -n "$pid_clash" ] && echo "内核		工作中	pid：$pid_clash" || echo "内核		未运行"
-	[ -n "$watchdog" ] && echo "进程守护		工作中	" || echo "进程守护		未运行"
+	[ "$watchdog" = 1 ] && echo "定时守护		已启用（每分钟检查）	" || echo "定时守护		未启用"
 	echo -----------------------------------------------------------
 	echo
 	echo ③ 检测iptables工作状态：
